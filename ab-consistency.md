@@ -216,27 +216,107 @@ ORDER BY (workspace_id, segment_id, state_id, user_id)
 
 #### 3.1.7 现有实现的风险规避策略
 
-**策略 1：工作流层面的并发控制（主要规避机制）**
+**策略 1：任务项级别的并发控制（主要规避机制）**
 
-`computePropertiesQueueWorkflow.ts` 中实现了工作区级别的并发控制：
+**重要修正**：并发控制粒度是**任务项级**，不是工作区级。
+
+`queueUtils.ts` 中的 `generateKeyFromItem` 函数定义了去重键规则：
 
 ```typescript
-// 1. membership 集合防止同一工作区同时入队
-const membership = new Set<string>();
-
-// 2. 信号量控制并发，但同一工作区不会重复入队
-const semaphore = new Semaphore(concurrency);
-
-// 3. 如果工作区已在处理中（inFlight 或 membership），不会重复添加
-if (!membership.has(newKey)) {
-  priorityQueue.push(newItem);
-  membership.add(newKey);
+export function generateKeyFromItem(item: WorkspaceQueueItem): string {
+  switch (item.type) {
+    case WorkspaceQueueItemType.Batch:
+      return `${item.type}:${item.workspaceId}`;  // 工作区级
+    case WorkspaceQueueItemType.Segment:
+    case WorkspaceQueueItemType.UserProperty:
+    case WorkspaceQueueItemType.Integration:
+    case WorkspaceQueueItemType.Journey:
+      return `${item.type}:${item.workspaceId}:${item.id}`;  // 属性级
+    case WorkspaceQueueItemType.Workspace:
+    case undefined:
+      return `${WorkspaceQueueItemType.Workspace}:${item.id}`;  // 工作区级
+    default:
+      assertUnreachable(item);
+  }
 }
 ```
 
+**不同类型任务的去重键：**
+
+| 任务类型 | 去重键格式 | 粒度 |
+|---------|-----------|------|
+| `Workspace` | `Workspace:{workspaceId}` | 工作区级 |
+| `Batch` | `Batch:{workspaceId}` | 工作区级 |
+| `Segment` | `Segment:{workspaceId}:{segmentId}` | 属性级 |
+| `UserProperty` | `UserProperty:{workspaceId}:{propertyId}` | 属性级 |
+| `Integration` | `Integration:{workspaceId}:{integrationId}` | 属性级 |
+| `Journey` | `Journey:{workspaceId}:{journeyId}` | 属性级 |
+
+**Split 模式下的并发处理：**
+
+当 `computePropertiesSplit = true` 时（`computePropertiesGroup` 函数，`computeProperties.ts:392-430`）：
+
+```typescript
+if (split) {
+  const individualItems: IndividualComputedPropertyQueueItem[] = [];
+  for (const userProperty of args.userProperties) {
+    individualItems.push({
+      type: WorkspaceQueueItemType.UserProperty,
+      workspaceId: params.workspaceId,
+      id: userProperty.id,
+      priority: QUEUE_ITEM_PRIORITIES.Split,
+    });
+  }
+  for (const segment of args.segments) {
+    individualItems.push({
+      type: WorkspaceQueueItemType.Segment,
+      workspaceId: params.workspaceId,
+      id: segment.id,
+      priority: QUEUE_ITEM_PRIORITIES.Split,
+    });
+  }
+  // ... 其他类型
+  return individualItems;
+}
+```
+
+**并发场景分析：**
+
+在 split 模式下，**同一工作区的 Segment 和 UserProperty 任务可以并行处理**：
+- 任务 A：`Segment:ws1:segment-1`
+- 任务 B：`UserProperty:ws1:user-property-1`
+
+这两个任务的去重键不同，因此可以同时被不同 Worker 处理。
+
+**对 A/B 一致性的影响：**
+
+RandomBucket Segment 的计算依赖 `idUserProperty`（用户身份属性）：
+
+```sql
+-- computePropertiesIncremental.ts:1505-1538
+from computed_property_state_v3 as cps
+where
+  (workspace_id, user_id) in (
+    select workspace_id, user_id
+    from updated_computed_property_state
+    where type = 'user_property'
+      and computed_property_id = ${userIdPropertyIdParam}
+      and state_id = ${userIdStateParam}
+      ...
+  )
+```
+
+**关键发现**：
+1. Segment 计算只处理 `updated_computed_property_state` 表中标记为"已更新"的用户
+2. UserProperty 任务更新用户属性后，会通过物化视图写入 `updated_computed_property_state`
+3. 如果 Segment 任务在 UserProperty 任务之前执行，只会处理之前已更新的用户
+4. 下一次计算周期会处理新更新的用户
+
 **效果：**
-- 同一工作区**不会被多个 Worker 同时处理**
-- 从根本上避免了"两个 Worker 同时处理同一用户"的场景
+- **同一任务项不会被多个 Worker 同时处理**（去重键保证）
+- **不同任务项可以并行处理**（split 模式优化）
+- **用户属性更新通过增量机制保证最终一致性**
+- 从根本上避免了"两个 Worker 同时处理同一任务"的场景
 
 **策略 2：确定性分桶算法（次要规避机制）**
 
@@ -483,6 +563,17 @@ DittoFeed 的 A/B 实验系统通过以下机制保证多 Worker 环境下的一
 - `wait_end_of_query=1` 确保写入完成后才返回，避免"写后读"不一致
 - `argMax` 聚合函数在查询时自动选择最新版本，即使存在重复行
 - 去重前后查询结果一致，只是存储效率不同
+
+**去重正确性的职责边界：**
+- **查询层（必须保证正确性）**：`argMax(segment_value, assigned_at)` 依赖时间戳选择逻辑上最新的版本
+- **存储层（性能优化）**：ClickHouse ReplacingMergeTree 合并只是删除物理重复行，不影响正确性
+- 两层职责分离，确保合并前后查询语义一致
+
+**同毫秒写入的风险与规避：**
+- **时间戳精度限制**：`Date.now()` 和 `DateTime64(3)` 都是毫秒级精度，存在同毫秒冲突的理论可能
+- **非确定性风险**：`argMax` 和 ReplacingMergeTree 在时间戳相同时行为取决于存储顺序
+- **主要规避策略**：工作流 `membership` 集合机制防止同一工作区被多个 Worker 同时处理
+- **次要规避策略**：确定性分桶算法确保即使重复计算，结果值也相同
 
 **流量调整的生效条件：**
 - **必须更新 `definitionUpdatedAt`** 才能触发重算
