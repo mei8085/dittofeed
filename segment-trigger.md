@@ -425,7 +425,7 @@ return api.removeContactFromList({  // ← 出分段时从列表移除
 
 #### 3.5.3 Journey 路径的去重闭环：从 OR 条件到写回逻辑
 
-虽然 `latest_segment_value = false` 在 Journey 路径中被过滤，**不会触发 Journey 启动**，但它仍会被写入 `processed_computed_properties_v2` 表。这形成了一个完整的去重闭环，防止出分段事件在后续查询中重复出现。
+虽然 `latest_segment_value = false` 在 Journey 路径中被过滤，**不会触发 Journey 启动**，但它仍会被写入 `processed_computed_properties_v2` 表。这形成了一个完整的去重闭环，防止**状态无变化时的重复处理**，但允许**状态反复切换时的正确处理**。
 
 ##### 第一步：buildProcessAssignmentsQuery 的 OR 条件
 
@@ -435,7 +435,7 @@ return api.removeContactFromList({  // ← 出分段时从列表移除
 WHERE
   (
     cpa.latest_user_property_value != pcp.user_property_value
-    OR cpa.latest_segment_value != pcp.segment_value  -- 差异判断
+    OR cpa.latest_segment_value != pcp.segment_value  -- 差异判断：cpa != pcp
   )
   AND (
       (cpa.latest_segment_value = true)  -- typeCondition：只保留入分段
@@ -456,6 +456,7 @@ WHERE
 | `true` | `true` | `true` | `false` | `true` | `true` | ❌ | 状态无变化 |
 
 **关键结论**：
+- 差异判断是 `cpa != pcp`，比较的是**当前状态**与**上一次写入的状态**
 - 当用户**从入分段变为出分段**时（`cpa=false, pcp=true`），满足 `pcp.user_id != ''` 的 OR 条件，会进入查询结果集
 - 当用户状态**无变化**时（`cpa=false, pcp=false` 或 `cpa=true, pcp=true`），差异判断为 false，不会进入结果集
 
@@ -464,7 +465,7 @@ WHERE
 在 `processRowsInner` 中（packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:3637-3748）：
 
 ```typescript
-// 第一步：分类
+// 第一步：分类（过滤）
 for (const assignment of assignments) {
   if (assignment.processed_for_type === "integration") {
     assignmentCategory = integrationAssignments;
@@ -509,40 +510,88 @@ await insertProcessedComputedProperties({
 -- processed_computed_properties_v2 子查询
 SELECT
   user_id,
-  argMax(segment_value, processed_at) segment_value  -- ← 取最新值
+  argMax(segment_value, processed_at) segment_value  -- ← 取最新值（argMax 按 processed_at 取最大的那条的 segment_value）
 FROM processed_computed_properties_v2
 WHERE ...
 GROUP BY user_id
 ```
 
-**出分段事件的完整生命周期**：
+**processed_computed_properties_v2 的 argMax 读取逻辑**：
+- 表是 INSERT-only 的，每次写回都会新增一条记录
+- 查询时使用 `argMax(segment_value, processed_at)` 取 `processed_at` 最新的那条记录的 `segment_value`
+- 所以 `pcp.segment_value` 实际上是**上一次写入的状态**
+
+##### 第四步：状态反复切换时的边界分析（true -> false -> true -> false）
+
+**差异判断的核心逻辑**：差异判断是 `cpa != pcp`，比较的是**当前状态**与**上一次写入的状态**。因此，当用户状态反复切换时，每次状态变化都会产生差异，出分段事件会在**每次从 true 切换到 false 时**都出现一次。
+
+**完整的状态演进示例**：
 
 ```
-第一次计算（用户从入分段变为出分段）：
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    场景：用户状态 true -> false -> true -> false              │
+│                         共 4 次状态变化，4 次计算                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+
+第 1 次计算：用户首次入分段（true）
+  cpa.latest_segment_value = true
+  pcp.segment_value = null（首次，无历史记录）
+  差异判断：true != null → true ✅
+  typeCondition：cpa.latest_segment_value = true → true ✅
+  → 用户进入结果集
+  → 触发 Journey（新用户入分段）
+  → 写回 pcp：segment_value = true
+
+第 2 次计算：用户首次出分段（false）
   cpa.latest_segment_value = false
-  pcp.segment_value = true （上一次写回的值）
+  pcp.segment_value = true（上一次写回的值）
   差异判断：false != true → true ✅
   OR 条件：pcp.user_id != '' → true ✅
   → 用户进入结果集
   → Journey 路径：被 continue 跳过，不触发
-  → 写回 processed_computed_properties_v2：segment_value = false
+  → 写回 pcp：segment_value = false
 
-第二次计算（用户状态不变，仍为出分段）：
+第 3 次计算：用户重新入分段（true）
+  cpa.latest_segment_value = true
+  pcp.segment_value = false（上一次写回的值）
+  差异判断：true != false → true ✅
+  typeCondition：cpa.latest_segment_value = true → true ✅
+  → 用户进入结果集
+  → 触发 Journey（用户重新入分段）
+  → 写回 pcp：segment_value = true
+
+第 4 次计算：用户再次出分段（false）
   cpa.latest_segment_value = false
-  pcp.segment_value = false （上一次写回的值）
-  差异判断：false != false → false ❌
-  → 用户不会进入结果集
+  pcp.segment_value = true（上一次写回的值）
+  差异判断：false != true → true ✅
+  OR 条件：pcp.user_id != '' → true ✅
+  → 用户进入结果集  ← 出分段事件再次出现！
+  → Journey 路径：被 continue 跳过，不触发
+  → 写回 pcp：segment_value = false
 ```
+
+**为什么出分段事件会再次出现？**
+
+| 次数 | cpa.latest_segment_value | pcp.segment_value | 差异判断 | 最终结果 | 原因 |
+|-----|-------------------------|-------------------|---------|---------|------|
+| 第 2 次 | `false` | `true` | `false != true` → `true` | ✅ | 首次出分段 |
+| 第 4 次 | `false` | `true` | `false != true` → `true` | ✅ | 再次出分段，`pcp.segment_value = true`（来自第 3 次写回） |
+
+**关键洞察**：
+- 第 3 次计算时，用户重新入分段，写回 `segment_value = true`
+- 第 4 次计算时，`pcp.segment_value = true`，`cpa.latest_segment_value = false`
+- 差异判断 `false != true → true`，出分段事件**再次出现**
+- 但由于 Journey 路径在代码层过滤了出分段用户，所以不会重复触发 Journey
 
 ##### 完整的去重闭环图
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                         第一次计算（用户出分段）                            │
+│           第 2 次计算（用户首次出分段：true -> false）                       │
 │                                                                          │
 │  buildProcessAssignmentsQuery:                                            │
 │    cpa.latest_segment_value = false                                       │
-│    pcp.segment_value = true （上一次的值）                                 │
+│    pcp.segment_value = true（第 1 次写回的值）                             │
 │    差异判断：false != true → true                                          │
 │    OR 条件：pcp.user_id != '' → true                                       │
 │    → 用户进入结果集 ✅                                                     │
@@ -559,37 +608,82 @@ GROUP BY user_id
 └──────────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌──────────────────────────────────────────────────────────────────────────┐
-│                         第二次计算（用户状态不变）                           │
+│           第 3 次计算（用户重新入分段：false -> true）                       │
+│                                                                          │
+│  buildProcessAssignmentsQuery:                                            │
+│    cpa.latest_segment_value = true                                        │
+│    pcp.segment_value = false（第 2 次写回的值）                            │
+│    差异判断：true != false → true                                          │
+│    typeCondition：cpa.latest_segment_value = true → true                  │
+│    → 用户进入结果集 ✅                                                     │
+│                                                                          │
+│  processRowsInner:                                                         │
+│    → 触发 Journey                                                         │
+│    → 写入 segment_value = true 到 processed_computed_properties_v2        │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│           第 4 次计算（用户再次出分段：true -> false）                       │
 │                                                                          │
 │  buildProcessAssignmentsQuery:                                            │
 │    cpa.latest_segment_value = false                                       │
-│    pcp.segment_value = false （上一次写回的值）                            │
-│    差异判断：false != false → false                                        │
-│    → 用户不会进入结果集 ❌                                                 │
+│    pcp.segment_value = true（第 3 次写回的值）                             │
+│    差异判断：false != true → true  ← 出分段事件再次出现！                   │
+│    OR 条件：pcp.user_id != '' → true                                       │
+│    → 用户进入结果集 ✅                                                     │
 │                                                                          │
-│  去重闭环完成！出分段事件只出现一次                                         │
+│  processRowsInner:                                                         │
+│    if (!assignment.latest_segment_value) continue;  // Journey 路径跳过    │
+│    → 不触发 Journey                                                       │
+│    → 写入 segment_value = false 到 processed_computed_properties_v2        │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
 
-##### 为何需要这个闭环？
+##### 去重闭环的真正作用
 
-如果不出分段用户不写入 `processed_computed_properties_v2`：
+去重闭环防止的是**状态无变化时的重复处理**，而不是"出分段事件只出现一次"。
+
+**如果不出分段用户不写入 `processed_computed_properties_v2`**：
 
 ```
-第一次计算：
+第 2 次计算（出分段）：
   cpa.latest_segment_value = false
   pcp.segment_value = true
   差异判断：true → 进入结果集
-  不写回 pcp
+  不写回 pcp（假设不写回）
 
-第二次计算：
+第 3 次计算（状态不变，仍为 false）：
   cpa.latest_segment_value = false
-  pcp.segment_value = true （仍然是旧值）
-  差异判断：true → 再次进入结果集 ❌
-  → 重复处理！
+  pcp.segment_value = true（仍然是旧值）
+  差异判断：false != true → true ❌
+  → 重复处理！（状态没变，但仍进入结果集）
 ```
 
-**结论**：虽然 Journey 路径不触发出分段事件，但必须将其写入 `processed_computed_properties_v2`，以确保下一次查询时差异判断失效，避免重复处理。
+**正确的行为（写回出分段用户）**：
+
+```
+第 2 次计算（出分段）：
+  cpa.latest_segment_value = false
+  pcp.segment_value = true
+  差异判断：true → 进入结果集
+  写回 pcp：segment_value = false
+
+第 3 次计算（状态不变，仍为 false）：
+  cpa.latest_segment_value = false
+  pcp.segment_value = false（上一次写回的值）
+  差异判断：false != false → false ✅
+  → 不进入结果集（正确，状态无变化）
+
+第 4 次计算（重新入分段 true -> 再次出分段 false）：
+  cpa.latest_segment_value = false
+  pcp.segment_value = true（第 3 次写回的 true）
+  差异判断：false != true → true ✅
+  → 进入结果集（正确，状态有变化）
+```
+
+**结论修正**：
+- ❌ 旧结论：去重闭环让出分段事件"只出现一次"
+- ✅ 新结论：去重闭环防止的是**状态无变化时的重复处理**。当用户状态反复切换（true->false->true->false）时，出分段事件会在**每次从 true 切换到 false 时**都出现一次。但由于 Journey 路径在代码层过滤了出分段用户，所以不会重复触发 Journey。
 
 ### 3.6 订阅关系建立
 
@@ -1035,6 +1129,9 @@ export const QUEUE_ITEM_PRIORITIES = {
 | Segment 编译为查询 | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | segmentNodeToStateSubQuery:1767, segmentToResolvedState:561 |
 | 赋值变更处理 | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | processAssignments:4049, buildProcessAssignmentsQuery:3786 |
 | **出分段过滤** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | processRowsInner:3602, 第 3642-3644 行 |
+| **出分段写回** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | 第 3739-3748 行 |
+| **OR 条件（出分段进入结果集）** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | 第 3897-3907 行 |
+| **写入 processed 表** | packages/backend-lib/src/userEvents/clickhouse.ts | insertProcessedComputedProperties:280 |
 | **全量重算判断** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | shouldResetComputedProperty:129 |
 | **下游更新时间处理** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | 第 3827-3833 行 |
 | **processedForUpdatedAt 来源** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | 第 4191 行(journey), 第 4235 行(integration) |
