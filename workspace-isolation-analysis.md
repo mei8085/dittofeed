@@ -55,6 +55,11 @@ async function buildWorkspaceIdClause(
 }
 ```
 
+**行为语义**：
+- 无子工作空间：返回 `workspace_id = 'xxx'`
+- 有子工作空间：返回 `workspace_id IN ('child1', 'child2', ...)`
+- **注意**：Parent 类型工作空间本身不接收事件（`canWorkspaceReceiveEvents` 排除 Parent），数据实际存储在 Child 工作空间中
+
 ---
 
 ## 二、数据写入阶段的 workspace_id 传递
@@ -377,41 +382,7 @@ export function getWorkspaceIdFromReq(
 }
 ```
 
-### 3.4 查询条件构建
-
-位置：`packages/backend-lib/src/userEvents.ts:311-466`
-
-```typescript
-function buildUserEventQueryClauses(
-  params: GetEventsRequest,
-  qb: ClickHouseQueryBuilder,
-) {
-  const { workspaceId, startDate, endDate, userId, ... } = params;
-
-  // 基础 workspace_id 过滤
-  const workspaceIdClause = `workspace_id = ${qb.addQueryValue(workspaceId, "String")}`;
-
-  // 其他过滤条件...
-  const startDateClause = startDate
-    ? `AND processing_time >= ${qb.addQueryValue(startDate, "DateTime64(3)")}`
-    : "";
-
-  // 内部事件优化查询（使用 internal_events 表）
-  const hasInternalEventFilters = broadcastId || journeyId || hasAllInternalEvents;
-  
-  const internalEventsConditions: string[] = [];
-  if (hasInternalEventFilters) {
-    internalEventsConditions.push(
-      `workspace_id = ${qb.addQueryValue(workspaceId, "String")}`,  // 再次过滤
-    );
-    // ... 其他条件
-  }
-
-  return { workspaceIdClause, ..., internalEventsConditions };
-}
-```
-
-### 3.5 父子工作空间查询处理
+### 3.4 查询条件构建（普通查询）
 
 位置：`packages/backend-lib/src/userEvents.ts:586-623`
 
@@ -428,7 +399,7 @@ export async function buildUserEventsQuery(
   const queryClauses = buildUserEventQueryClauses(params, qb);
 
   const innerQuery = buildUserEventInnerQuery(
-    { ...queryClauses, workspaceIdClause },
+    { ...queryClauses, workspaceIdClause },  // 覆盖 queryClauses 中的 workspaceIdClause
     includeContext,
   );
 
@@ -439,48 +410,388 @@ export async function buildUserEventsQuery(
 }
 ```
 
-### 3.6 内部查询构建示例
+**关键细节**：
+- `buildUserEventsQuery` 先调用 `buildWorkspaceIdClause` 处理父子关系
+- 然后用结果**覆盖** `queryClauses` 中的 `workspaceIdClause`
+- 这种设计意味着外层 WHERE 条件是正确的，但嵌入在子查询字符串中的条件可能不一致
 
-位置：`packages/backend-lib/src/userEvents.ts:484-584`
+### 3.5 按 messageId 查询的语义
+
+位置：`packages/backend-lib/src/userEvents.ts:342-374`
+
+```typescript
+function buildUserEventQueryClauses(...) {
+  // 注意：这里使用的是固定值，不包含子工作空间
+  const workspaceIdClause = `workspace_id = ${qb.addQueryValue(workspaceId, "String")}`;
+
+  let messageIdClause = "";
+  if (messageId) {
+    let messageIdWhereClause: string;
+    if (typeof messageId === "string") {
+      messageIdWhereClause = `AND message_id = ${qb.addQueryValue(messageId, "String")}`;
+    } else {
+      messageIdWhereClause = `AND message_id IN ${qb.addQueryValue(messageId, "Array(String)")}`;
+    }
+
+    // 关键：messageIdClause 内部嵌入了固定的 workspaceIdClause
+    messageIdClause = `
+      AND (workspace_id, processing_time, user_or_anonymous_id, event_time, message_id) IN (
+        SELECT
+          workspace_id,
+          max(processing_time),
+          user_or_anonymous_id,
+          argMax(event_time, processing_time),
+          message_id
+        FROM user_events_v2
+        WHERE
+          ${workspaceIdClause}  -- 这里使用的是固定值！
+          ${messageIdWhereClause}
+        GROUP BY
+          workspace_id,
+          user_or_anonymous_id,
+          message_id
+      )
+    `;
+  }
+  // ...
+}
+```
+
+**语义差异**：
+
+| 场景 | 子查询条件 | 父子支持 |
+|------|-----------|----------|
+| 普通查询（无 messageId） | 外层使用 buildWorkspaceIdClause | ✓ 支持 |
+| messageId 查询 | 子查询内部使用固定 `workspace_id = ?` | ✗ 不支持 |
+
+**影响**：当用父工作空间的 ID 查询指定 messageId 的事件时：
+- 外层 WHERE：`workspace_id IN ('child1', 'child2', ...)`
+- messageId 子查询：`workspace_id = 'parent-id'`
+- 由于 Parent 工作空间不接收事件，子查询可能返回空结果
+
+### 3.6 Internal Events 两阶段查询的语义
+
+位置：`packages/backend-lib/src/userEvents.ts:386-465`
+
+```typescript
+function buildUserEventQueryClauses(...) {
+  // 内部事件过滤条件（用于两阶段查询）
+  const internalEventsConditions: string[] = [];
+  if (hasInternalEventFilters) {
+    internalEventsConditions.push(
+      `workspace_id = ${qb.addQueryValue(workspaceId, "String")}`,  // 固定值！
+    );
+
+    if (startDate) {
+      internalEventsConditions.push(
+        `processing_time >= ${qb.addQueryValue(startDate, "DateTime64(3)")}`,
+      );
+    }
+    if (endDate) {
+      internalEventsConditions.push(
+        `processing_time <= ${qb.addQueryValue(endDate, "DateTime64(3)")}`,
+      );
+    }
+    if (broadcastId) {
+      internalEventsConditions.push(
+        `broadcast_id = ${qb.addQueryValue(broadcastId, "String")}`,
+      );
+    }
+    if (journeyId) {
+      internalEventsConditions.push(
+        `journey_id = ${qb.addQueryValue(journeyId, "String")}`,
+      );
+    }
+    if (hasAllInternalEvents) {
+      internalEventsConditions.push(
+        `event IN ${qb.addQueryValue(dfEvents, "Array(String)")}`,
+      );
+    }
+  }
+  // ...
+}
+```
+
+位置：`packages/backend-lib/src/userEvents.ts:510-545`
 
 ```typescript
 function buildUserEventInnerQuery(...) {
-  // 两阶段查询模式：先从 internal_events 过滤，再关联主表
+  // 两阶段查询模式
   if (hasInternalEventFilters && internalEventsConditions.length > 0) {
     return `
-      SELECT workspace_id, user_id, ...
+      SELECT ...
       FROM user_events_v2
       WHERE
-        ${workspaceIdClause}
+        ${workspaceIdClause}  -- 外层：可能是 IN 子句
         AND (workspace_id, processing_time, user_or_anonymous_id, event_time, message_id) IN (
           SELECT
             workspace_id, processing_time, user_or_anonymous_id, event_time, message_id
           FROM internal_events
-          WHERE ${internalEventsConditions.join(" AND ")}
+          WHERE ${internalEventsConditions.join(" AND ")}  -- 内层：固定 workspace_id = ?
         )
-        ${userIdClause}
         ...
     `;
   }
-
-  // 普通查询模式
-  return `
-    SELECT workspace_id, user_id, ...
-    FROM user_events_v2
-    WHERE
-      ${workspaceIdClause}
-      ${startDateClause}
-      ${endDateClause}
-      ...
-  `;
+  // ...
 }
 ```
 
+**语义差异**：
+
+| 层级 | 查询条件 | 父子支持 |
+|------|----------|----------|
+| 外层 user_events_v2 | `buildWorkspaceIdClause` 结果（可能是 IN） | ✓ |
+| 内层 internal_events 子查询 | 固定 `workspace_id = ?` | ✗ |
+
+**影响**：当用父工作空间的 ID 按 broadcastId 或 journeyId 查询时：
+- 外层：查子工作空间的数据
+- 内层 internal_events 子查询：查父工作空间本身的数据
+- 由于 Parent 不接收事件，内层子查询可能返回空
+- **结果**：整个查询可能返回空，而实际上子工作空间中有数据
+
+### 3.7 对比 users.ts 中的正确模式
+
+位置：`packages/backend-lib/src/users.ts:166-261`
+
+```typescript
+// users.ts 中的模式：先定义可复用的函数
+const buildWorkspaceIdClause = (qb: ClickHouseQueryBuilder) =>
+  childWorkspaceIds.length > 0
+    ? `workspace_id IN (${qb.addQueryValue(childWorkspaceIds, "Array(String)")})`
+    : `workspace_id = ${qb.addQueryValue(workspaceId, "String")}`;
+
+// 在需要的地方调用此函数
+const workspaceIdClause = buildWorkspaceIdClause(qb);
+```
+
+**差异**：
+- `users.ts`：在构建所有条件**之前**获取 childWorkspaceIds，然后通过函数调用注入
+- `userEvents.ts`：`buildUserEventQueryClauses` 先构建条件（使用固定值），外层再尝试覆盖
+
+### 3.8 其他查询函数的父子支持状态
+
+| 函数 | 位置 | workspace_id 条件 | 父子支持 |
+|------|------|------------------|----------|
+| `findManyInternalEvents` | userEvents.ts:153-173 | `workspace_id = {workspaceId}` | ✗ |
+| `findUserIdByMessageId` | userEvents.ts:175-195 | `workspace_id = {workspaceId}` | ✗ |
+| `findIdentifyTraits` | userEvents.ts:232-260 | `workspace_id = {workspaceId}` | ✗ |
+| `findTrackProperties` | userEvents.ts:262-307 | `workspace_id = ${workspaceIdParam}` | ✗ |
+| `findUserEventsById` | userEvents.ts:922-976 | `workspace_id = ?`（可选！） | ✗ |
+| `buildUserEventsQuery` | userEvents.ts:586-623 | 调用 `buildWorkspaceIdClause` | ✓ |
+| `findUserEventCount` | userEvents.ts:689-754 | 调用 `buildWorkspaceIdClause` | ✓ |
+
+**注意**：`findUserEventsById` 的 `workspaceId` 参数是可选的！如果不传，查询将没有 workspace_id 过滤条件。
+
 ---
 
-## 四、ClickHouse 表结构与隔离设计
+## 四、四类接口的完整传递链
 
-### 4.1 核心表结构
+### 4.1 接口参数定义
+
+位置：`packages/isomorphic-lib/src/types.ts`
+
+```typescript
+// events 接口
+export const GetEventsRequest = Type.Object({
+  workspaceId: Type.String(),
+  searchTerm: Type.Optional(Type.String()),
+  userId: Type.Optional(UserId),
+  offset: Type.Optional(Type.Number()),
+  limit: Type.Optional(Type.Number()),
+  messageId: Type.Optional(Type.Union([Type.String(), Type.Array(Type.String())])),
+  startDate: Type.Optional(Type.Number()),
+  endDate: Type.Optional(Type.Number()),
+  event: Type.Optional(Type.Array(Type.String())),
+  broadcastId: Type.Optional(Type.String()),
+  journeyId: Type.Optional(Type.String()),
+  eventType: Type.Optional(Type.String()),
+  includeContext: Type.Optional(Type.Boolean()),
+});
+
+// download 接口（与 events 基本一致，去掉 offset/limit）
+export const DownloadEventsRequest = Type.Omit(GetEventsRequest, ["offset", "limit"]);
+
+// traits 接口（仅 workspaceId）
+export const GetTraitsRequest = Type.Object({
+  workspaceId: Type.String(),
+});
+
+// properties 接口（仅 workspaceId）
+export const GetPropertiesRequest = Type.Object({
+  workspaceId: Type.String(),
+});
+```
+
+### 4.2 Events 接口传递链
+
+**接口**：`GET /api/events`
+
+**完整路径**：
+```
+HTTP Request (query: workspaceId, searchTerm, startDate, endDate, etc.)
+    ↓
+requestContext 中间件（验证 JWT，提取 workspaceId）
+    ↓
+eventsController.GET / (eventsController.ts:22-77)
+    ↓
+findManyEventsWithCount(request.query)
+    ├── findUserEvents(params)
+    │   └── buildUserEventsQuery(params)
+    │       ├── buildWorkspaceIdClause(workspaceId, qb)  ✓ 父子扩展
+    │       └── buildUserEventQueryClauses(params, qb)
+    └── findUserEventCount(params)
+        └── buildWorkspaceIdClause(workspaceId, qb)  ✓ 父子扩展
+    ↓
+chQuery() → ClickHouse
+    ↓
+返回转换（剔除 workspace_id 字段）
+    ↓
+HTTP Response { events: [...], count: N }
+```
+
+**父子支持**：✓（但 messageId 和 internal events 过滤存在语义差异）
+
+### 4.3 Traits 接口传递链
+
+**接口**：`GET /api/events/traits`
+
+**完整路径**：
+```
+HTTP Request (query: workspaceId)
+    ↓
+requestContext 中间件
+    ↓
+eventsController.GET /traits (eventsController.ts:79-97)
+    ↓
+findIdentifyTraits({ workspaceId: request.query.workspaceId })
+    ↓
+ClickHouse 查询（userEvents.ts:232-260）
+    ├── 直接使用 `workspace_id = {workspaceId}`
+    ├── 无父子扩展
+    └── 查询 identify 事件的 properties 键
+    ↓
+返回 { traits: ["email", "name", ...] }
+```
+
+**父子支持**：✗
+
+位置：`packages/backend-lib/src/userEvents.ts:232-260`
+
+```typescript
+export async function findIdentifyTraits({
+  workspaceId,
+  limit = 500,
+}: {
+  workspaceId: string;
+  limit?: number;
+}): Promise<string[]> {
+  const query = `
+    SELECT DISTINCT
+      arrayJoin(JSONExtractKeys(properties)) AS trait
+    FROM user_events_v2
+    WHERE
+      workspace_id = {workspaceId:String}  -- 固定值，无子扩展
+      and event_type = 'identify'
+    limit {limit:Int32}
+  `;
+  // ...
+}
+```
+
+### 4.4 Properties 接口传递链
+
+**接口**：`GET /api/events/properties`
+
+**完整路径**：
+```
+HTTP Request (query: workspaceId)
+    ↓
+requestContext 中间件
+    ↓
+eventsController.GET /properties (eventsController.ts:99-117)
+    ↓
+findTrackProperties({ workspaceId: request.query.workspaceId })
+    ↓
+ClickHouse 查询（userEvents.ts:262-307）
+    ├── 直接使用 `workspace_id = ${workspaceIdParam}`
+    ├── 无父子扩展
+    └── 查询 track 事件的 properties 键
+    ↓
+返回 { properties: { "event1": ["prop1", "prop2"], ... } }
+```
+
+**父子支持**：✗
+
+位置：`packages/backend-lib/src/userEvents.ts:262-307`
+
+```typescript
+export async function findTrackProperties({
+  workspaceId,
+  limit = 500,
+}: {
+  workspaceId: string;
+  limit?: number;
+}): Promise<GetPropertiesResponse["properties"]> {
+  const qb = new ClickHouseQueryBuilder();
+  const workspaceIdParam = qb.addQueryValue(workspaceId, "String");  // 固定值
+  const limitParam = qb.addQueryValue(limit, "Int32");
+  const query = `
+    SELECT
+      arrayJoin(JSONExtractKeys(properties)) AS property,
+      max(processing_time) AS max_processing_time,
+      event
+    FROM user_events_v2
+    WHERE
+      workspace_id = ${workspaceIdParam}  -- 固定值，无子扩展
+      and event_type = 'track'
+    GROUP BY property, event
+    ORDER BY max_processing_time DESC
+    LIMIT ${limitParam}
+  `;
+  // ...
+}
+```
+
+### 4.5 Download 接口传递链
+
+**接口**：`GET /api/events/download`
+
+**完整路径**：
+```
+HTTP Request (query: workspaceId, startDate, endDate, etc.)
+    ↓
+requestContext 中间件
+    ↓
+eventsController.GET /download (eventsController.ts:119-140)
+    ↓
+buildEventsFile(request.query)
+    ├── findManyEventsWithCount(params)
+    │   ├── findUserEvents(params)
+    │   │   └── buildUserEventsQuery(params)
+    │   │       └── buildWorkspaceIdClause  ✓ 父子扩展
+    │   └── findUserEventCount(params)
+    │       └── buildWorkspaceIdClause  ✓ 父子扩展
+    └── 构建 CSV 内容
+    ↓
+返回 CSV 文件（Content-Type: text/csv）
+```
+
+**父子支持**：✓（与 events 接口存在相同的语义差异）
+
+### 4.6 四类接口对比汇总
+
+| 接口 | 路径 | 核心函数 | 父子支持 | 说明 |
+|------|------|----------|----------|------|
+| events | `/api/events` | `buildUserEventsQuery` | ✓ | 支持，但 messageId / internal events 过滤存在差异 |
+| traits | `/api/events/traits` | `findIdentifyTraits` | ✗ | 直接 `workspace_id = ?` |
+| properties | `/api/events/properties` | `findTrackProperties` | ✗ | 直接 `workspace_id = ?` |
+| download | `/api/events/download` | `buildEventsFile` | ✓ | 复用 events 查询逻辑 |
+
+---
+
+## 五、ClickHouse 表结构与隔离设计
+
+### 5.1 核心表结构
 
 #### user_events_v2（主事件表）
 位置：`packages/backend-lib/src/userEvents/clickhouse.ts:299-365`
@@ -558,7 +869,7 @@ ENGINE = ReplacingMergeTree()
 ORDER BY (workspace_id, type, computed_property_id, user_id);
 ```
 
-### 4.2 物化视图的数据传播
+### 5.2 物化视图的数据传播
 
 #### internal_events 的 MV
 位置：`packages/backend-lib/src/userEvents/clickhouse.ts:45-69`
@@ -595,7 +906,7 @@ ORDER BY (workspace_id, type, computed_property_id, state_id, user_id, event_tim
 - 删除工作空间数据时可以直接 DROP PARTITION
 - 查询时 ClickHouse 可以跳过不相关的分区
 
-### 4.3 冷存储表
+### 5.3 冷存储表
 位置：`packages/backend-lib/src/userEvents/clickhouse.ts:516-530`
 
 ```sql
@@ -614,9 +925,9 @@ SETTINGS storage_policy = 'cold_storage';
 
 ---
 
-## 五、PostgreSQL 数据库隔离
+## 六、PostgreSQL 数据库隔离
 
-### 5.1 表设计模式
+### 6.1 表设计模式
 
 几乎所有 PostgreSQL 业务表都遵循以下模式（`packages/backend-lib/src/db/schema.ts`）：
 
@@ -635,7 +946,7 @@ SETTINGS storage_policy = 'cold_storage';
 | UserPropertyAssignment | workspaceId | ON DELETE CASCADE | (workspaceId, userPropertyId, userId) |
 | WorkspaceMemberRole | workspaceId | ON DELETE CASCADE | (workspaceId, workspaceMemberId) |
 
-### 5.2 外键约束示例
+### 6.2 外键约束示例
 
 ```typescript
 // Segment 表示例 (schema.ts:736-780)
@@ -657,7 +968,7 @@ export const segment = pgTable("Segment", {
 ]);
 ```
 
-### 5.3 查询时的 workspace 过滤
+### 6.3 查询时的 workspace 过滤
 
 位置：`packages/backend-lib/src/segments.ts` (示例)
 
@@ -672,15 +983,15 @@ export async function findSegments({ workspaceId }: { workspaceId: string }) {
 
 ---
 
-## 六、跨数据库数据同步与隔离
+## 七、跨数据库数据同步与隔离
 
-### 6.1 计算属性同步流程
+### 7.1 计算属性同步流程
 
 ClickHouse 的 `computed_property_assignments_v2` 数据会同步到 PostgreSQL 的 `SegmentAssignment` 和 `UserPropertyAssignment` 表。
 
 **关键**：同步过程中始终携带 workspace_id。
 
-### 6.2 ClickHouse 到 PostgreSQL 的数据流动
+### 7.2 ClickHouse 到 PostgreSQL 的数据流动
 
 ```
 ClickHouse (computed_property_assignments_v2)
@@ -714,9 +1025,9 @@ export async function insertProcessedComputedProperties({
 
 ---
 
-## 七、工作空间生命周期管理
+## 八、工作空间生命周期管理
 
-### 7.1 暂停/恢复工作空间
+### 8.1 暂停/恢复工作空间
 
 位置：`packages/backend-lib/src/workspaces.ts:257-294`
 
@@ -752,7 +1063,7 @@ export async function resumeWorkspace({ workspaceId }, options = {}) {
 }
 ```
 
-### 7.2 冷存储数据移动
+### 8.2 冷存储数据移动
 
 位置：`packages/backend-lib/src/workspaces.ts:26-124`
 
@@ -785,7 +1096,7 @@ export async function coldStoreWorkspaceEvents({ workspaceId }) {
 }
 ```
 
-### 7.3 逻辑删除（Tombstone）
+### 8.3 逻辑删除（Tombstone）
 
 位置：`packages/backend-lib/src/workspaces.ts:133-177`
 
@@ -822,9 +1133,9 @@ export async function tombstoneWorkspace(workspaceId, options = {}) {
 
 ---
 
-## 八、接口返回阶段
+## 九、接口返回阶段
 
-### 8.1 事件查询接口
+### 9.1 事件查询接口
 
 位置：`packages/api/src/controllers/eventsController.ts:22-77`
 
@@ -855,7 +1166,7 @@ fastify.withTypeProvider<TypeBoxTypeProvider>().get("/", {
 });
 ```
 
-### 8.2 认证后的访问控制
+### 9.2 认证后的访问控制
 
 位置：`packages/api/src/buildApp/requestContext.ts:72-88`
 
@@ -874,9 +1185,9 @@ if (workspaceId !== workspace.id) {
 
 ---
 
-## 九、隔离边界总结
+## 十、隔离边界总结
 
-### 9.1 ClickHouse 隔离边界
+### 10.1 ClickHouse 隔离边界
 
 | 层级 | 实现方式 | 关键位置 |
 |------|----------|----------|
@@ -887,7 +1198,7 @@ if (workspaceId !== workspace.id) {
 | 查询 | 所有 SELECT 强制 `workspace_id` 过滤 | buildUserEventQueryClauses |
 | MV传播 | 物化视图继承源表 `workspace_id` | internal_events_mv 等 |
 
-### 9.2 PostgreSQL 隔离边界
+### 10.2 PostgreSQL 隔离边界
 
 | 层级 | 实现方式 | 关键位置 |
 |------|----------|----------|
@@ -896,7 +1207,7 @@ if (workspaceId !== workspace.id) {
 | 唯一约束 | 联合唯一索引包含 `workspaceId` | uniqueIndex 定义 |
 | 查询 | 所有查询显式 `eq(workspaceId)` | 各业务模块 |
 
-### 9.3 认证层隔离边界
+### 10.3 认证层隔离边界
 
 | 场景 | 认证方式 | workspace_id 来源 |
 |------|----------|-------------------|
@@ -904,16 +1215,59 @@ if (workspaceId !== workspace.id) {
 | 管理 API | JWT + Session | requestContext + header/query |
 | 内部服务 | 直接传递 | 函数参数 |
 
-### 9.4 潜在风险点
+### 10.4 潜在风险点
 
 1. **原生 SQL 注入风险**：使用 `ClickHouseQueryBuilder` 参数化查询避免
 2. **跨 workspace 数据泄露**：通过 `requestContext` 中间件验证防止
 3. **父子工作空间数据混淆**：`buildWorkspaceIdClause` 显式处理
 4. **工作空间删除不完全**：级联删除 + 逻辑删除 + 冷存储三重保障
 
+### 10.5 复核发现的语义差异问题
+
+#### 问题 1：messageId 查询不支持父子工作空间
+
+**影响函数**：`buildUserEventQueryClauses` 中 `messageIdClause` 构建
+
+**问题描述**：
+- 子查询内部嵌入的是固定 `workspace_id = ?`
+- 即使外层被 `buildWorkspaceIdClause` 覆盖，子查询内部已固化
+
+**修复建议**：参考 `users.ts` 模式，在构建条件前先获取 childWorkspaceIds
+
+#### 问题 2：internal events 两阶段查询语义不一致
+
+**影响函数**：`internalEventsConditions` 构建
+
+**问题描述**：
+- 外层 user_events_v2：`buildWorkspaceIdClause` 结果（可能 IN）
+- 内层 internal_events：固定 `workspace_id = ?`
+- 查询 Parent 工作空间时，内层查不到数据
+
+**修复建议**：将 childWorkspaceIds 传入 `buildUserEventQueryClauses`
+
+#### 问题 3：traits / properties 接口不支持父子
+
+**影响函数**：`findIdentifyTraits`, `findTrackProperties`
+
+**问题描述**：
+- 直接使用固定 `workspace_id = ?`
+- 与 events / download 接口行为不一致
+
+**修复建议**：在函数内部调用 `buildWorkspaceIdClause` 或复用通用逻辑
+
+#### 问题 4：findUserEventsById 中 workspaceId 可选
+
+**影响函数**：`findUserEventsById`
+
+**问题描述**：
+- 参数 `workspaceId?: string`
+- 如果不传，查询没有 workspace_id 过滤
+
+**修复建议**：将 `workspaceId` 改为必需参数
+
 ---
 
-## 十、关键代码文件索引
+## 十一、关键代码文件索引
 
 | 功能 | 文件路径 |
 |------|----------|
@@ -929,3 +1283,5 @@ if (workspaceId !== workspace.id) {
 | API 请求上下文中间件 | packages/api/src/buildApp/requestContext.ts |
 | workspaceId 提取逻辑 | packages/api/src/workspace.ts |
 | 事件提交封装 | packages/backend-lib/src/apps.ts |
+| 用户查询（正确父子模式参考） | packages/backend-lib/src/users.ts |
+| 类型定义 | packages/isomorphic-lib/src/types.ts |
