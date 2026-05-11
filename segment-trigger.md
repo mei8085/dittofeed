@@ -423,6 +423,174 @@ return api.removeContactFromList({  // ← 出分段时从列表移除
 | 语义 | 单向"进入"触发 | 双向状态同步 |
 | 生命周期管理 | Workflow 内部通过 Signal 管理 | 每次变化都触发独立动作 |
 
+#### 3.5.3 Journey 路径的去重闭环：从 OR 条件到写回逻辑
+
+虽然 `latest_segment_value = false` 在 Journey 路径中被过滤，**不会触发 Journey 启动**，但它仍会被写入 `processed_computed_properties_v2` 表。这形成了一个完整的去重闭环，防止出分段事件在后续查询中重复出现。
+
+##### 第一步：buildProcessAssignmentsQuery 的 OR 条件
+
+在 `buildProcessAssignmentsQuery` 的 WHERE 子句中（packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:3897-3907）：
+
+```sql
+WHERE
+  (
+    cpa.latest_user_property_value != pcp.user_property_value
+    OR cpa.latest_segment_value != pcp.segment_value  -- 差异判断
+  )
+  AND (
+      (cpa.latest_segment_value = true)  -- typeCondition：只保留入分段
+      OR (
+          pcp.user_id != ''  -- ← OR 条件：允许"之前在段中"的出分段用户
+      )
+  )
+```
+
+**完整真值表（Journey 路径，type = segment）**：
+
+| cpa.latest_segment_value | pcp.segment_value | pcp.user_id != '' | 差异判断 | typeCondition | OR 条件 | 最终结果 | 含义 |
+|-------------------------|-------------------|------------------|---------|--------------|--------|---------|------|
+| `true` | `null`（首次） | `false` | `true` | `true` | `true` | ✅ | 新用户入分段 |
+| `true` | `false` | `true` | `true` | `true` | `true` | ✅ | 用户从出分段变为入分段 |
+| `false` | `true` | `true` | `true` | `false` | `true` | ✅ | 用户从入分段变为出分段 |
+| `false` | `false` | `true` | `false` | `false` | `true` | ❌ | 状态无变化 |
+| `true` | `true` | `true` | `false` | `true` | `true` | ❌ | 状态无变化 |
+
+**关键结论**：
+- 当用户**从入分段变为出分段**时（`cpa=false, pcp=true`），满足 `pcp.user_id != ''` 的 OR 条件，会进入查询结果集
+- 当用户状态**无变化**时（`cpa=false, pcp=false` 或 `cpa=true, pcp=true`），差异判断为 false，不会进入结果集
+
+##### 第二步：processRowsInner 的过滤与写回
+
+在 `processRowsInner` 中（packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:3637-3748）：
+
+```typescript
+// 第一步：分类
+for (const assignment of assignments) {
+  if (assignment.processed_for_type === "integration") {
+    assignmentCategory = integrationAssignments;
+  } else {
+    if (!assignment.latest_segment_value) {
+      continue;  // ← Journey 路径：出分段用户被跳过，不触发
+    }
+    assignmentCategory = journeySegmentAssignments;
+  }
+  assignmentCategory.push(assignment);
+}
+
+// 第二步：触发下游（只针对分类后的用户）
+await Promise.all([
+  ...journeySegmentAssignments.flatMap(/* 触发 Journey */),
+  ...integrationAssignments.flatMap(/* 触发 Integration */),
+]);
+
+// 第三步：写回（使用原始的 assignments，而非分类后的）
+const processedAssignments: ComputedPropertyAssignment[] =
+  assignments.flatMap((assignment) => ({
+    user_property_value: assignment.latest_user_property_value,
+    segment_value: assignment.latest_segment_value,
+    ...assignment,
+  }));
+
+await insertProcessedComputedProperties({
+  assignments: processedAssignments,  // ← 包含所有 assignments，包括出分段
+});
+```
+
+**关键点**：
+- `journeySegmentAssignments` 和 `integrationAssignments` 是**过滤后的**列表，用于触发下游
+- `processedAssignments` 来自**原始的 `assignments`**，包含所有出分段用户
+- **出分段用户虽然不触发 Journey，但会被写入 `processed_computed_properties_v2`**
+
+##### 第三步：写回对后续查询的影响
+
+写回 `processed_computed_properties_v2` 后，下一次查询时：
+
+```sql
+-- processed_computed_properties_v2 子查询
+SELECT
+  user_id,
+  argMax(segment_value, processed_at) segment_value  -- ← 取最新值
+FROM processed_computed_properties_v2
+WHERE ...
+GROUP BY user_id
+```
+
+**出分段事件的完整生命周期**：
+
+```
+第一次计算（用户从入分段变为出分段）：
+  cpa.latest_segment_value = false
+  pcp.segment_value = true （上一次写回的值）
+  差异判断：false != true → true ✅
+  OR 条件：pcp.user_id != '' → true ✅
+  → 用户进入结果集
+  → Journey 路径：被 continue 跳过，不触发
+  → 写回 processed_computed_properties_v2：segment_value = false
+
+第二次计算（用户状态不变，仍为出分段）：
+  cpa.latest_segment_value = false
+  pcp.segment_value = false （上一次写回的值）
+  差异判断：false != false → false ❌
+  → 用户不会进入结果集
+```
+
+##### 完整的去重闭环图
+
+```
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         第一次计算（用户出分段）                            │
+│                                                                          │
+│  buildProcessAssignmentsQuery:                                            │
+│    cpa.latest_segment_value = false                                       │
+│    pcp.segment_value = true （上一次的值）                                 │
+│    差异判断：false != true → true                                          │
+│    OR 条件：pcp.user_id != '' → true                                       │
+│    → 用户进入结果集 ✅                                                     │
+│                                                                          │
+│  processRowsInner:                                                         │
+│    if (!assignment.latest_segment_value) continue;  // Journey 路径跳过    │
+│    → 不触发 Journey                                                       │
+│                                                                          │
+│    const processedAssignments = assignments.flatMap(...)                   │
+│    → 包含出分段用户                                                        │
+│                                                                          │
+│    insertProcessedComputedProperties:                                     │
+│      → 写入 segment_value = false 到 processed_computed_properties_v2     │
+└──────────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌──────────────────────────────────────────────────────────────────────────┐
+│                         第二次计算（用户状态不变）                           │
+│                                                                          │
+│  buildProcessAssignmentsQuery:                                            │
+│    cpa.latest_segment_value = false                                       │
+│    pcp.segment_value = false （上一次写回的值）                            │
+│    差异判断：false != false → false                                        │
+│    → 用户不会进入结果集 ❌                                                 │
+│                                                                          │
+│  去重闭环完成！出分段事件只出现一次                                         │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+##### 为何需要这个闭环？
+
+如果不出分段用户不写入 `processed_computed_properties_v2`：
+
+```
+第一次计算：
+  cpa.latest_segment_value = false
+  pcp.segment_value = true
+  差异判断：true → 进入结果集
+  不写回 pcp
+
+第二次计算：
+  cpa.latest_segment_value = false
+  pcp.segment_value = true （仍然是旧值）
+  差异判断：true → 再次进入结果集 ❌
+  → 重复处理！
+```
+
+**结论**：虽然 Journey 路径不触发出分段事件，但必须将其写入 `processed_computed_properties_v2`，以确保下一次查询时差异判断失效，避免重复处理。
+
 ### 3.6 订阅关系建立
 
 在 `processAssignments` 中建立 segment -> journey 的映射：
@@ -869,8 +1037,11 @@ export const QUEUE_ITEM_PRIORITIES = {
 | **出分段过滤** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | processRowsInner:3602, 第 3642-3644 行 |
 | **全量重算判断** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | shouldResetComputedProperty:129 |
 | **下游更新时间处理** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | 第 3827-3833 行 |
+| **processedForUpdatedAt 来源** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | 第 4191 行(journey), 第 4235 行(integration) |
 | 计算流程编排 | packages/backend-lib/src/computedProperties/computePropertiesWorkflow/activities/computeProperties.ts | computePropertiesIncremental |
 | Journey 触发 | packages/backend-lib/src/journeys.ts | triggerSegmentEntryJourney:814 |
 | User Journey 工作流 | packages/backend-lib/src/journeys/userWorkflow.ts | userJourneyWorkflow:206, segmentUpdateSignal |
 | **Integration 双向同步** | packages/backend-lib/src/integrations/hubspot/activities.ts | 第 1037-1048 行 |
+| **Period 数据库 Schema** | packages/backend-lib/src/db/schema.ts | computedPropertyPeriod:885 |
 | **Period 管理** | packages/backend-lib/src/computedProperties/periods.ts | createPeriods:195, getPeriodsByComputedPropertyId:138 |
+| **Period 创建（三个阶段）** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | ComputeState:3171, ComputeAssignments:3576, ProcessAssignments:4283 |
