@@ -1162,6 +1162,252 @@ fastify.withTypeProvider<TypeBoxTypeProvider>().put(
 
 ---
 
+#### 8.4.9 拒绝链路分支矩阵
+
+**前提**：`UpsertBroadcastV2Request.config` 是 `Type.Optional`，不是所有请求都会经过 `BroadcastV2Config.message` 的 Union 校验。
+
+```typescript
+// packages/isomorphic-lib/src/types.ts:6121-6127
+export const BaseUpsertBroadcastV2Request = Type.Object({
+  workspaceId: Type.String(),
+  segmentId: NullableAndOptional(Type.String()),
+  messageTemplateId: NullableAndOptional(Type.String()),
+  subscriptionGroupId: NullableAndOptional(Type.String()),
+  config: Type.Optional(BroadcastV2Config),  // ← 可选！
+  scheduledAt: NullableAndOptional(Type.String()),
+});
+```
+
+这意味着：
+- **有 config**：请求会先经过 `BroadcastV2Config` 的完整 schema 校验
+- **无 config**：请求不会经过 `BroadcastV2Config.message` 的 Union 校验
+
+**四种路径分支矩阵**：
+
+| 路径 | 操作 | config 存在 | channel 来源 | 拦截层 | 结果 |
+|------|------|------------|-------------|--------|------|
+| **路径 1** | 创建 | ✅ 是 | `config.message.type` | **L2 Schema** | Fastify 400 Bad Request |
+| **路径 2** | 创建 | ❌ 否 | `messageTemplate.definition.type` + `subscriptionGroup.channel` | **L3 Backend** | 400 ConstraintViolation |
+| **路径 3** | 更新 | ✅ 是 | `config.message.type` | **L2 Schema** | Fastify 400 Bad Request |
+| **路径 4** | 更新 | ❌ 否 | `messageTemplate.definition.type` + `subscriptionGroup.channel` | **无** | 理论可通过（更新路径无检查） |
+
+---
+
+#### 8.4.10 分支路径详解
+
+##### 路径 1：创建 + 有 config
+
+```
+请求: PUT /broadcasts/v2
+Body: {
+  name: "My Broadcast",
+  messageTemplateId: "...",
+  subscriptionGroupId: "...",
+  config: {
+    type: "V2",
+    message: {
+      type: "MobilePush"  // ← 这里
+    }
+  }
+}
+        ↓
+[L2 Schema 拦截]
+Fastify + TypeBox 校验 BroadcastV2Config.message 的 Union:
+  Type.Union([
+    BroadcastEmailMessageVariant,
+    BroadcastSmsMessageVariant,
+    Type.Omit(WebhookMessageVariant, ["templateId"]),
+    // 没有 MobilePush
+  ])
+        ↓
+schema validation failed
+        ↓
+响应: 400 Bad Request
+```
+
+##### 路径 2：创建 + 无 config
+
+```
+请求: PUT /broadcasts/v2
+Body: {
+  name: "My Broadcast",
+  messageTemplateId: "template-mobilepush-123",  // MobilePush 类型的模板
+  subscriptionGroupId: "sg-mobilepush-456",     // MobilePush 类型的订阅组
+  // 没有 config 字段
+}
+        ↓
+[跳过 L2 Schema 拦截]
+因为 config 是 Optional，message union 校验不触发
+        ↓
+[L3 Backend 拦截]
+upsertBroadcastV2 进入创建分支（!existing）
+        ↓
+Step 1: 收集 channel（broadcasts.ts:510-519）
+  const channels = new Set<ChannelType>();
+  if (messageTemplateDefinition) channels.add("MobilePush");
+  if (subscriptionGroup) channels.add("MobilePush");
+  // config 不存在，不加入
+        ↓
+Step 2: 一致性校验通过（channels.size === 1）
+        ↓
+Step 3: MobilePush 显式检查（broadcasts.ts:595-600）
+  const channel: ChannelType = "MobilePush";
+  if (channel === ChannelType.MobilePush) {
+    return err({
+      type: ConstraintViolation,
+      message: "Mobile push is not supported yet",
+    });
+  }
+        ↓
+响应: 400 ConstraintViolation
+       "Mobile push is not supported yet"
+```
+
+##### 路径 3：更新 + 有 config
+
+```
+请求: PUT /broadcasts/v2
+Body: {
+  id: "existing-broadcast-123",
+  config: {
+    type: "V2",
+    message: {
+      type: "MobilePush"  // ← 这里
+    }
+  }
+}
+        ↓
+[L2 Schema 拦截]
+同路径 1，BroadcastV2Config.message Union 校验失败
+        ↓
+响应: 400 Bad Request
+```
+
+##### 路径 4：更新 + 无 config
+
+```
+请求: PUT /broadcasts/v2
+Body: {
+  id: "existing-broadcast-123",
+  messageTemplateId: "template-mobilepush-123",  // MobilePush 类型的模板
+  // 没有 config 字段
+}
+        ↓
+[跳过 L2 Schema 拦截]
+config 是 Optional，message union 校验不触发
+        ↓
+[进入后端]
+upsertBroadcastV2 进入更新分支（existing）
+        ↓
+Step 1: 收集 channel（broadcasts.ts:510-519）
+  const channels = new Set<ChannelType>();
+  if (messageTemplateDefinition) channels.add("MobilePush");
+  // config 不存在，不加入
+  // subscriptionGroup 可能是原来的 Email
+        ↓
+Step 2: 一致性校验
+  channels.size > 1? → 可能触发 ConstraintViolation（类型不一致）
+  或 channels.size === 1 → 通过
+        ↓
+Step 3: 没有 MobilePush 检查！
+  更新分支（if (existing)）没有 595-600 行的检查
+        ↓
+理论上可以通过（如果一致性校验通过）
+```
+
+**注意**：路径 4 是一个边缘情况。更新路径没有 MobilePush 显式检查，但在实际场景中：
+- 现有 broadcast 的 `subscriptionGroup.channel` 大概率是 Email/SMS/Webhook
+- 如果更新 `messageTemplateId` 为 MobilePush，会导致 `channels.size > 1`
+- 这会触发"类型不一致"的 ConstraintViolation（第 520-526 行）
+- 只有当 `messageTemplate`、`subscriptionGroup` 同时都是 MobilePush 时，才有可能通过
+
+---
+
+#### 8.4.11 时序总结
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     请求进入 Fastify                             │
+└─────────────────────────┬───────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              L2: TypeBox Schema 校验                            │
+│                                                                 │
+│  有 config? ────────────────────────────────────────────┐      │
+│      │                                                  │      │
+│     是                                                  否     │
+│      │                                                  │      │
+│      ▼                                                  │      │
+│  BroadcastV2Config.message Union 校验                    │      │
+│      │                                                  │      │
+│   type === MobilePush? ────────────────┐                │      │
+│      │                                 │                │      │
+│     是                                 │                │      │
+│      │                                 │                │      │
+│      ▼                                 │                │      │
+│  400 Bad Request                       │                │      │
+│  (拦截点: L2 Schema)                   │                │      │
+│                                        │                │      │
+│                                       否                │      │
+│                                        │                │      │
+│                                        ▼                │      │
+│                                   通过校验               │      │
+│                                        │                │      │
+│                                        └────────┬───────┘      │
+│                                                 │              │
+│                                                 ▼              │
+└─────────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│             L3: upsertBroadcastV2 业务逻辑                      │
+│                                                                 │
+│  创建? ──────────────────────────────────────────────┐         │
+│      │                                              │         │
+│     是                                              否         │
+│      │                                              │         │
+│      ▼                                              │         │
+│  收集 channel:                                       │         │
+│  - messageTemplate.type                             │         │
+│  - subscriptionGroup.channel                        │         │
+│  - config.message.type (如果有)                      │         │
+│      │                                              │         │
+│      ▼                                              │         │
+│  channel === MobilePush? ─────────────────┐         │         │
+│      │                                    │         │         │
+│     是                                    │         │         │
+│      │                                    │         │         │
+│      ▼                                    │         │         │
+│  400 ConstraintViolation                  │         │         │
+│  "Mobile push is not supported yet"       │         │         │
+│  (拦截点: L3 Backend)                     │         │         │
+│                                           │         │         │
+│                                          否         │         │
+│                                           │         │         │
+│                                           ▼         │         │
+│                                      通过检查       │         │
+│                                           │         │         │
+│                                           └────┬────┘         │
+│                                                │              │
+│                                                ▼              │
+│                                           更新路径            │
+│                                           (无 MobilePush 检查) │
+│                                                │              │
+│                                                ▼              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**结论**：
+
+| 拦截类型 | 触发条件 | 拦截层 |
+|---------|---------|--------|
+| **Schema 拦截** | 有 config 且 `config.message.type === MobilePush` | L2 |
+| **Backend 拦截** | 创建路径 + 无 config + channel 来源于 messageTemplate/subscriptionGroup 且为 MobilePush | L3 |
+| **无拦截** | 更新路径 + 无 config + 一致性校验通过 | - |
+
+---
+
 ### 8.5 批量发送协调
 
 批量发送通过 `batchMessageUsers` 函数处理（`packages/backend-lib/src/messaging.ts:2536+`）：
@@ -1297,7 +1543,7 @@ const trackEvents: KnownBatchTrackData[] = messageResults.flatMap(
 |--------|--------|-----------|---------|
 | P0 | 完成 MobilePush 发送流程 | 中 | 打通 FCM → sendMessage → Broadcast/Journey |
 | P0 | 修正 MobilePush 错误归类 | 小 | 改为返回 `BadWorkspaceConfiguration` |
-| P0 | Broadcast V2 支持 MobilePush | 中 | 消息 Union + 前端编辑器 + 发送逻辑 |
+| P0 | Broadcast V2 支持 MobilePush | 中 | 解除三层拦截：前端启用 + 类型 Union + 后端移除 ConstraintViolation + 发送逻辑 |
 | P1 | 完善 Twilio 可重试判断 | 小 | 参照 SignalWire，识别 429/5xx |
 | P1 | 实现 Journey RateLimitNode | 中 | 新增配置字段 + 执行逻辑（可能需要 Redis） |
 | P1 | 实现 Provider 自动 Failover | 中 | 优先级列表 + 不可重试错误时切换 |
