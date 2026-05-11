@@ -118,6 +118,27 @@ Your email is {{ user.email }}.
 | `{% subscription_management_url %}` | 生成纯订阅管理 URL | `liquid.ts:196-200` |
 | `{% view_in_browser_url %}` | 生成网页版查看 URL | `liquid.ts:234-238` |
 
+### 2.5.1 各渠道标识符键（Identifier Key）
+
+**文件位置**：`packages/isomorphic-lib/src/channels.ts:3-10`
+
+```typescript
+export const CHANNEL_IDENTIFIERS: Record<
+  Exclude<ChannelType, "Webhook">,
+  string
+> = {
+  [ChannelType.Email]: "email",
+  [ChannelType.MobilePush]: "deviceToken",
+  [ChannelType.Sms]: "phone",
+};
+```
+
+**说明**：
+- Email → `email` 用户属性
+- SMS → `phone` 用户属性
+- MobilePush → `deviceToken` 用户属性
+- Webhook → 无固定标识符，支持自定义属性访问
+
 **使用示例**：
 ```liquid
 {% unsubscribe_link 点击这里退订 %}
