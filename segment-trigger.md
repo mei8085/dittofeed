@@ -451,62 +451,361 @@ const subscribedJourneyMap = journeys.reduce<Map<string, Set<string>>>(
 
 ### 4.1 增量计算的核心：Period 机制
 
-Period 用于追踪每个 computed property 的计算进度，实现增量计算。
+Period 用于追踪每个 computed property 在**不同计算阶段**的计算进度，实现增量计算。
+
+#### 4.1.1 Period 数据库表结构
+
+Period 存储在 Postgres 的 `ComputedPropertyPeriod` 表中（packages/backend-lib/src/db/schema.ts:885）：
 
 ```typescript
-// packages/backend-lib/src/computedProperties/periods.ts
-interface Period {
-  maxFrom: Date;  // 已处理的起始时间
-  maxTo: Date;    // 已处理的结束时间（下一次从此开始）
+// 完整的数据库表字段
+export const computedPropertyPeriod = pgTable(
+  "ComputedPropertyPeriod",
+  {
+    id: uuid().primaryKey().defaultRandom().notNull(),      // 记录唯一标识
+    workspaceId: uuid().notNull(),                           // 工作空间 ID
+    type: computedPropertyType().notNull(),                  // "Segment" | "UserProperty"
+    computedPropertyId: uuid().notNull(),                    // segment/userProperty ID
+    version: text().notNull(),                               // 版本号 = definitionUpdatedAt 时间戳字符串
+    from: timestamp({ precision: 3, mode: "date" }),        // 当前 Period 的起始边界（可为 null）
+    to: timestamp({ precision: 3, mode: "date" }).notNull(), // 当前 Period 的结束边界
+    step: text().notNull(),                                  // 计算阶段：ComputeState / ComputeAssignments / ProcessAssignments
+    createdAt: timestamp({ precision: 3, mode: "date" }).defaultNow().notNull(),
+  },
+  ...
+);
+```
+
+#### 4.1.2 Period 的类型定义
+
+在代码中使用的类型是数据库表的投影（packages/backend-lib/src/computedProperties/periods.ts:44-59）：
+
+```typescript
+// 数据库完整类型
+export type AggregatedComputedPropertyPeriod = Omit<
+  ComputedPropertyPeriod,
+  "from" | "workspaceId" | "to"
+> & {
+  maxTo: string;  // 该 computedProperty 最新的 to 时间
+};
+
+// 实际使用的 Period 类型
+export type Period = Overwrite<
+  Pick<
+    AggregatedComputedPropertyPeriod,
+    "maxTo" | "computedPropertyId" | "version" | "type"
+  >,
+  {
+    maxTo: Date;  // 转换为 Date 类型
+  }
+>;
+```
+
+**注意**：实际使用的 `Period` 类型**不包含 `from` 字段**，只保留 `maxTo`、`computedPropertyId`、`version`、`type`。`from` 字段只在创建新 Period 记录时使用。
+
+#### 4.1.3 `from` 的来源
+
+在 `createPeriods` 函数中（packages/backend-lib/src/computedProperties/periods.ts:195-249）：
+
+```typescript
+for (const segment of segments) {
+  const version = segment.definitionUpdatedAt.toString();
+  
+  // 获取同一 version 的上一个 Period
+  const previousPeriod = periodByComputedPropertyId?.get({
+    version,
+    computedPropertyId: segment.id,
+  });
+  
+  newPeriods.push({
+    // ...
+    from: previousPeriod ? previousPeriod.maxTo : null,  // ← from 来源
+    to: nowD,
+    // ...
+  });
 }
 ```
 
-**获取计算窗口**：
+**`from` 的来源规则**：
+- 如果存在**同一 version** 的 `previousPeriod`，则 `from = previousPeriod.maxTo`
+- 否则 `from = null`（首次计算或 version 变化）
+
+#### 4.1.4 三个计算阶段的独立 Period
+
+Dittofeed 的三个计算阶段都有独立的 Period 记录：
+
+```typescript
+// 阶段一：computeState 完成后（packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:3171）
+await createPeriods({
+  step: ComputedPropertyStepEnum.ComputeState,
+  // ...
+});
+
+// 阶段二：computeAssignments 完成后（packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:3576）
+await createPeriods({
+  step: ComputedPropertyStepEnum.ComputeAssignments,
+  // ...
+});
+
+// 阶段三：processAssignments 完成后（packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:4283）
+await createPeriods({
+  step: ComputedPropertyStepEnum.ProcessAssignments,
+  // ...
+});
+```
+
+#### 4.1.5 Period 查询逻辑
+
+在 `getPeriodsByComputedPropertyId` 函数中（packages/backend-lib/src/computedProperties/periods.ts:138）：
+
+```sql
+SELECT DISTINCT ON (workspaceId, type, computedPropertyId)
+  type,
+  computedPropertyId,
+  version,
+  MAX(to) OVER (
+    PARTITION BY workspaceId, type, computedPropertyId
+  ) as maxTo  -- 取该 computedProperty 的最大 to
+FROM computedPropertyPeriod
+WHERE step = ?  -- 按阶段过滤
+ORDER BY workspaceId, type, computedPropertyId, to DESC
+```
+
+**查询结果包含的字段**：`type`、`computedPropertyId`、`version`、`maxTo`。**不包含 `from` 字段**。
+
+#### 4.1.6 获取计算窗口
+
 ```typescript
 const period = periodByComputedPropertyId.get({
   computedPropertyId: segment.id,
-  version: segment.definitionUpdatedAt.toString(),  // 版本号作为 part of key
+  version: segment.definitionUpdatedAt.toString(),  // key: computedPropertyId + version
 });
 const periodBound = period?.maxTo.getTime();  // 增量起始点
 ```
 
-### 4.2 全量重算的触发条件
+**关键逻辑**：
+- 只有当 `version` 匹配时才返回 Period
+- 如果 Segment 定义被修改（`definitionUpdatedAt` 变化），version 变化，`periodByComputedPropertyId.get()` 返回 `undefined`
+- `periodBound = undefined` 时，增量边界失效，进行全量计算
+
+---
+
+### 4.2 buildProcessAssignmentsQuery 的边界逻辑
+
+在 `buildProcessAssignmentsQuery` 函数中（packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:3786-3912），`periodBound` 与 `processedForUpdatedAt` 共同决定 `lowerBoundClause` 是否生效。
+
+#### 4.2.1 `processedForUpdatedAt` 的来源
+
+`processedForUpdatedAt` 是**下游消费者**的更新时间：
+
+```typescript
+// Journey 消费者（packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:4191）
+const processor = new AssignmentProcessor({
+  // ...
+  processedForUpdatedAt: journey.updatedAt,  // ← Journey 的更新时间
+  // ...
+});
+
+// Integration 消费者（packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:4235）
+const processor = new AssignmentProcessor({
+  // ...
+  processedForUpdatedAt: integration.updatedAt,  // ← Integration 的更新时间
+  // ...
+});
+```
+
+#### 4.2.2 联合判断逻辑
+
+```typescript
+// packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:3823-3833
+const period = periodByComputedPropertyId.get({
+  computedPropertyId,
+  version: computedPropertyVersion,
+});
+const periodBound = period?.maxTo.getTime();
+
+// 关键逻辑：如果下游消费者在 last period 内被更新过，忽略 bound
+const lowerBoundClause =
+  periodBound && periodBound > 0 && periodBound > processedForUpdatedAt
+    ? `and assigned_at >= toDateTime64(${periodBound / 1000}, 3)`
+    : "";
+```
+
+**判断条件分解**：
+
+| 条件 | 含义 |
+|-----|------|
+| `periodBound && periodBound > 0` | 存在有效的上一周期进度（非首次计算） |
+| `periodBound > processedForUpdatedAt` | 上一周期结束时间 **晚于** 消费者的更新时间 |
+
+**完整真值表**：
+
+| periodBound | processedForUpdatedAt | 条件结果 | lowerBoundClause | 实际行为 |
+|------------|----------------------|---------|-----------------|---------|
+| `undefined`（首次或 version 变化） | 任意 | `false` | 空字符串 | **全量处理**所有 assignments |
+| 有效 | `periodBound <= processedForUpdatedAt` | `false` | 空字符串 | **全量处理**（消费者更新过，需重新触发） |
+| 有效 | `periodBound > processedForUpdatedAt` | `true` | `and assigned_at >= periodBound` | **增量处理**（只处理新变更） |
+
+#### 4.2.3 对 Journey 和 Integration 路径的影响
+
+**两条路径使用完全相同的判断逻辑**，但由于其他过滤条件的存在，实际效果不同：
+
+**Journey 路径**：
+- 判断逻辑：`periodBound > journey.updatedAt`
+- 如果 Journey 是**新创建**的：`journey.updatedAt` 是当前时间，`periodBound <= journey.updatedAt` → **全量处理**
+- 如果 Journey 是**已存在**的：`journey.updatedAt` 是历史时间，`periodBound > journey.updatedAt` → **增量处理**
+
+**Integration 路径**：
+- 判断逻辑：`periodBound > integration.updatedAt`
+- 如果 Integration 是**新创建**的：`integration.updatedAt` 是当前时间，`periodBound <= integration.updatedAt` → **全量处理**
+- 如果 Integration 是**已存在**的：`integration.updatedAt` 是历史时间，`periodBound > integration.updatedAt` → **增量处理**
+
+**场景示例**：
+
+| 场景 | periodBound | journey.updatedAt | 条件 | lowerBoundClause | 实际处理范围 |
+|-----|------------|------------------|------|-----------------|-------------|
+| **首次计算**（无 periodBound） | `undefined` | 2026-05-11 | `false` | 空 | 全量用户 |
+| **新建 Journey 订阅现有 Segment** | 2026-05-10 | 2026-05-11 | `false` | 空 | 全量用户（给新 Journey 重新触发） |
+| **修改已存在的 Journey** | 2026-05-10 | 2026-05-11 | `false` | 空 | 全量用户（给修改后的 Journey 重新触发） |
+| **普通增量运行** | 2026-05-10 | 2026-05-01 | `true` | `>= 2026-05-10` | 只处理 5-10 之后的新变更 |
+
+#### 4.2.4 lowerBoundClause 在 SQL 查询中的位置
+
+```sql
+SELECT
+  ...
+FROM (
+  SELECT
+    user_id,
+    max(assigned_at) max_assigned_at,
+    argMax(segment_value, assigned_at) latest_segment_value
+  FROM computed_property_assignments_v2
+  WHERE
+    workspace_id = ?
+    AND type = 'segment'
+    AND computed_property_id = ?
+    ${innerCursorClause}
+    ${lowerBoundClause}  -- ← 在这里生效：只查询 periodBound 之后的新 assignments
+  GROUP BY user_id
+  ORDER BY user_id ASC
+) cpa
+LEFT ANY JOIN (
+  -- processed_computed_properties_v2 查询...
+) pcp ON cpa.user_id = pcp.user_id
+WHERE ...
+```
+
+---
+
+### 4.3 shouldReset 全量重算条件
 
 函数：`shouldResetComputedProperty` (packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:129)
 
 ```typescript
 function shouldResetComputedProperty({
-  definitionUpdatedAt,  // segment 定义更新时间
-  createdAt,            // segment 创建时间
-  now,
-  periodBound,          // 当前增量窗口
+  definitionUpdatedAt,  // segment 定义更新时间（timestamp ms）
+  createdAt,            // segment 创建时间（timestamp ms）
+  now,                  // 当前时间（timestamp ms）
+  periodBound,          // 上一周期的 maxTo
 }): boolean {
   if (!definitionUpdatedAt) {
     return false;
   }
   return (
-    definitionUpdatedAt <= now &&
-    definitionUpdatedAt >= (periodBound ?? 0) &&
-    definitionUpdatedAt > createdAt
+    definitionUpdatedAt <= now &&           // 条件1: 定义更新已发生
+    definitionUpdatedAt >= (periodBound ?? 0) &&  // 条件2: 定义更新在当前周期内（或无历史记录）
+    definitionUpdatedAt > createdAt         // 条件3: 不是首次创建
   );
 }
 ```
 
-**触发全量重算的场景**：
-1. Segment 定义被修改（`definitionUpdatedAt` 更新）
-2. 定义更新发生在当前计算周期内
+#### 4.3.1 三个条件的详细解释
 
-**全量重算时执行**：
-```sql
--- 清除旧的 assignment 记录
-DELETE FROM computed_property_assignments_v2
-WHERE workspace_id = ?
-  AND type = 'segment'
-  AND computed_property_id = ?
-  AND assigned_at < now()
+| 条件 | 含义 | 场景说明 |
+|-----|------|---------|
+| `definitionUpdatedAt <= now` | 定义更新已发生 | 排除未来时间点的无效更新 |
+| `definitionUpdatedAt >= periodBound` | 定义更新发生在**当前计算周期内** | 若 `definitionUpdatedAt` 在 `periodBound` 之前，说明之前已处理过该版本，无需重算 |
+| `definitionUpdatedAt > createdAt` | 不是首次创建 | 首次创建时 `definitionUpdatedAt == createdAt`，不触发重算（首次运行本身就是全量） |
+
+#### 4.3.2 shouldReset 对 Assignment 计算的影响
+
+在 `computeAssignments` 中（packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:3326-3420）：
+
+```typescript
+const shouldReset = shouldResetComputedProperty({
+  definitionUpdatedAt: segment.definitionUpdatedAt,
+  createdAt: segment.createdAt,
+  now,
+  periodBound,
+});
+
+if (!allStateIdsPruned || shouldReset) {
+  // 执行 assignment INSERT 查询（全量或增量，取决于 lowerBoundClause）
+  assignmentQueries.push(...);
+}
+
+if (shouldReset) {
+  logger().debug({ segment, workspaceId }, "Resetting segment");
+  // 全量重算时的额外处理...
+}
 ```
 
-### 4.3 两种模式的对比
+#### 4.3.3 shouldReset 与 lowerBoundClause 的区别
+
+| 机制 | 所在阶段 | 检查对象 | 影响范围 |
+|-----|---------|---------|---------|
+| **shouldReset** | computeAssignments | Segment 定义本身 | 是否**重新计算**所有用户的 segment 归属 |
+| **lowerBoundClause** | processAssignments | 下游消费者（Journey/Integration） | 是否**重新触发**已有用户给下游消费者 |
+
+```
+┌───────────────────────────────────────────────────────────────────────┐
+│              计算阶段 (computeAssignments)                              │
+│                                                                       │
+│  shouldReset = definitionUpdatedAt 在 periodBound 之后？                │
+│  ├─ YES → 全量重算（重新计算所有用户的 segment 归属）                    │
+│  └─ NO  → 增量计算（只处理 periodBound 之后的新事件）                    │
+│  └─ 影响：computed_property_assignments_v2 表的数据                    │
+└───────────────────────────────────────────────────────────────────────┘
+                                    ↓
+┌───────────────────────────────────────────────────────────────────────┐
+│              处理阶段 (processAssignments)                              │
+│                                                                       │
+│  lowerBoundClause = periodBound > processedForUpdatedAt ?              │
+│  ├─ YES → 增量处理（只处理 periodBound 之后的新 assignments）           │
+│  └─ NO  → 全量处理（重新处理所有已有 assignments）                      │
+│  └─ 影响：下游消费者（Journey 启动、Integration 同步）                  │
+└───────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 4.4 全量重算的执行细节
+
+当 `shouldReset = true` 时，在 `computeAssignments` 中执行：
+
+```sql
+-- 插入新的 assignment（全量）
+INSERT INTO computed_property_assignments_v2
+SELECT
+  workspace_id,
+  'segment',
+  segment_id,
+  user_id,
+  {assignment_expression} as segment_value,
+  '',
+  max_state_event_time,
+  now() as assigned_at
+FROM (
+  -- 从 resolved_segment_state 全量计算
+  ...
+)
+```
+
+**注意**：Dittofeed 采用 INSERT-only 模式，不删除旧记录，而是通过 `argMax(segment_value, assigned_at)` 取最新值来实现"更新"。
+
+---
+
+### 4.5 两种模式的对比
 
 | 维度 | 增量更新 | 全量重算 |
 |-----|---------|---------|
@@ -561,13 +860,17 @@ export const QUEUE_ITEM_PRIORITIES = {
 
 ## 五、代码引用索引
 
-| 功能 | 文件位置 | 关键函数 |
-|-----|---------|---------|
+| 功能 | 文件位置 | 关键函数/行号 |
+|-----|---------|--------------|
 | Segment 定义 | packages/isomorphic-lib/src/types.ts | SegmentDefinition, SegmentNode |
 | Segment 资源操作 | packages/backend-lib/src/segments.ts | upsertSegment, findEnrichedSegment |
-| Segment 编译为查询 | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | segmentNodeToStateSubQuery, segmentToResolvedState |
+| Segment 编译为查询 | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | segmentNodeToStateSubQuery:1767, segmentToResolvedState:561 |
+| 赋值变更处理 | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | processAssignments:4049, buildProcessAssignmentsQuery:3786 |
+| **出分段过滤** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | processRowsInner:3602, 第 3642-3644 行 |
+| **全量重算判断** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | shouldResetComputedProperty:129 |
+| **下游更新时间处理** | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | 第 3827-3833 行 |
 | 计算流程编排 | packages/backend-lib/src/computedProperties/computePropertiesWorkflow/activities/computeProperties.ts | computePropertiesIncremental |
-| 赋值变更处理 | packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts | processAssignments, buildProcessAssignmentsQuery |
-| Journey 触发 | packages/backend-lib/src/journeys.ts | triggerSegmentEntryJourney, findSubscribedRunningJourneysForSegment |
-| User Journey 工作流 | packages/backend-lib/src/journeys/userWorkflow.ts | userJourneyWorkflow, segmentUpdateSignal |
-| Period 管理 | packages/backend-lib/src/computedProperties/periods.ts | createPeriods, getPeriodsByComputedPropertyId |
+| Journey 触发 | packages/backend-lib/src/journeys.ts | triggerSegmentEntryJourney:814 |
+| User Journey 工作流 | packages/backend-lib/src/journeys/userWorkflow.ts | userJourneyWorkflow:206, segmentUpdateSignal |
+| **Integration 双向同步** | packages/backend-lib/src/integrations/hubspot/activities.ts | 第 1037-1048 行 |
+| **Period 管理** | packages/backend-lib/src/computedProperties/periods.ts | createPeriods:195, getPeriodsByComputedPropertyId:138 |
