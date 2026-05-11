@@ -1631,6 +1631,454 @@ if (workspaceId !== processedWorkspaceId) {
 - 这是唯一的调用点
 - 修改函数签名影响范围可控
 
+### 11.9 同批次多 workspace 事件的隔离边界深度分析
+
+#### 11.9.1 问题背景
+
+SendGrid Webhook 可能在同一批次中推送多个邮件的事件。如果这些邮件来自不同的 workspace，就会触发本章节分析的隔离边界问题。
+
+**事件类型与 workspaceId 来源**：
+
+| 事件类型 | 示例 | workspaceId 来源 | 是否需要回填 |
+|---------|------|-----------------|-------------|
+| Immediate | open, click, delivered, dropped, processed | 事件本身的 `sg_message_id` + `workspaceId` 自定义参数 | 否 |
+| Delayed | bounce, spamreport | 无，需通过 `smtp-id` 回填 | 是 |
+
+#### 11.9.2 当前流程的完整时序分析
+
+**位置**：`packages/backend-lib/src/destinations/sendgrid.ts:217-370`
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 1: 推断全局 workspaceId（line 234-240）                    │
+├─────────────────────────────────────────────────────────────────┤
+│  for (const event of sendgridEvents) {                          │
+│    if (event.workspaceId) {                                     │
+│      workspaceId = event.workspaceId;  // 取第一个！            │
+│      break;                                                     │
+│    }                                                           │
+│  }                                                             │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 2: 分类事件（line 241-265）                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  for (const event of sendgridEvents) {                          │
+│    switch (event.event) {                                       │
+│      case "spamreport":                                         │
+│      case "bounce":                                             │
+│        delayedEvents.set(smtp-id, event);  // 延迟事件           │
+│        break;                                                   │
+│      default:                                                   │
+│        immediateEvents.push(event);  // ⚠️ 没有校验 workspaceId！│
+│        break;                                                   │
+│    }                                                           │
+│  }                                                             │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 3: 延迟事件回填（line 267-306）                              │
+├─────────────────────────────────────────────────────────────────┤
+│  3a. 跨 workspace 查询 processed 事件                            │
+│  3b. 解析每个事件的 properties，提取 processedWorkspaceId        │
+│  3c. 校验：workspaceId === processedWorkspaceId                  │
+│  3d. 不匹配则跳过（continue）                                     │
+│                                                                │
+│  ✅ delayed events 有校验！                                      │
+└─────────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────────┐
+│ Step 4: 合流写入（line 364-367）                                 │
+├─────────────────────────────────────────────────────────────────┤
+│  await submitSendgridEvents({                                   │
+│    workspaceId,  // 单一值！从 Step 1 推断                       │
+│    events: [...immediateEvents, ...backfilledDelayedEvents],    │
+│  });                                                            │
+│                                                                │
+│  ⚠️ 所有事件用同一个 workspaceId 写入！                           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 11.9.3 写入链路确认
+
+**submitSendgridEvents**（`packages/backend-lib/src/destinations/sendgrid.ts:191-215`）：
+```typescript
+export async function submitSendgridEvents({
+  workspaceId,  // 参数传入
+  events,
+}: {
+  workspaceId: string;
+  events: SendgridEvent[];
+}) {
+  const data: BatchAppData = {
+    batch: events.flatMap((e) =>
+      sendgridEventToDF({ sendgridEvent: e })
+        .mapErr((error) => { ... })
+        .unwrapOr([]),
+    ),
+  };
+  await submitBatch({
+    workspaceId,  // 使用传入的，不使用事件内部的
+    data,
+  });
+}
+```
+
+**submitBatch**（`packages/backend-lib/src/apps/batch.ts:89-110`）：
+```typescript
+export async function submitBatch({ workspaceId, data }, ...) {
+  await Promise.all(
+    chunks.map(async (chunk) => {
+      return submitBatchChunk(
+        { workspaceId, data: chunkData },  // 继续传递
+        ...
+      );
+    }),
+  );
+}
+```
+
+**submitBatchChunk**（`packages/backend-lib/src/apps/batch.ts:68-87`）：
+```typescript
+await insertUserEvents({
+  workspaceId,  // 最终写入使用这个值
+  userEvents,
+}, ...);
+```
+
+**结论**：写入 ClickHouse 时，`workspace_id` 列使用的是 `submitBatch` 参数传入的值，而不是事件本身的 `workspaceId`。
+
+#### 11.9.4 校验缺口对比
+
+| 事件类型 | Step 1 来源 | Step 2 分类校验 | Step 3 回填校验 | Step 4 写入校验 | 风险 |
+|---------|------------|----------------|----------------|----------------|------|
+| **Immediate** | 事件本身 `workspaceId` | ❌ 无 | N/A | ❌ 无 | **误写** |
+| **Delayed** | 从 processed 推断 | N/A | ✅ 有 | ❌ 无 | 数据丢失 |
+
+**关键发现**：
+- Immediate events 在 Step 2 被加入 `immediateEvents` 数组时，**没有任何校验**
+- Step 4 写入时，所有事件使用同一个 `workspaceId`
+- 如果批次中有来自多个 workspace 的 immediate events，除了第一个之外的都会被误写
+
+### 11.10 可复现的误写场景
+
+#### 场景 D：多 workspace Immediate Events 混合同一批次
+
+**严重级别**：🔴 高（跨 workspace 误写）
+
+**前提条件**：
+1. Workspace A（`ws-a`）和 Workspace B（`ws-b`）共享同一个 SendGrid 账号配置
+2. 两个 workspace 使用同一个 Webhook 端点（URL 相同）
+3. 两个 workspace 都配置了正确的 SendGrid Webhook 签名密钥
+
+**触发条件**：
+1. Workspace A 发送邮件 → 邮件被打开 → SendGrid 记录 `open` 事件
+2. Workspace B 发送邮件 → 邮件被点击 → SendGrid 记录 `click` 事件
+3. 由于网络延迟或批处理，两个事件在**同一批次**推送到 Webhook
+
+**批次内容示例**：
+```json
+[
+  {
+    "email": "user-a@example.com",
+    "event": "open",
+    "timestamp": 1715000001,
+    "sg_event_id": "sg-event-001",
+    "sg_message_id": "sg-msg-a-001.filterdrecv-8-7",
+    "smtp-id": "<smtp-a-001@dittofeed>",
+    "workspaceId": "ws-a",
+    "userId": "user-a-uuid",
+    "broadcastId": "broadcast-a",
+    "journeyId": "journey-a",
+    "runId": "run-a"
+  },
+  {
+    "email": "user-b@example.com",
+    "event": "click",
+    "timestamp": 1715000002,
+    "sg_event_id": "sg-event-002",
+    "sg_message_id": "sg-msg-b-001.filterdrecv-8-7",
+    "smtp-id": "<smtp-b-001@dittofeed>",
+    "workspaceId": "ws-b",  // ⚠️ 不同的 workspaceId
+    "userId": "user-b-uuid",
+    "broadcastId": "broadcast-b",
+    "journeyId": "journey-b",
+    "runId": "run-b"
+  }
+]
+```
+
+**执行流程**：
+
+```
+Step 1: 推断 workspaceId
+  遍历事件：
+    第 1 个事件：event.workspaceId = "ws-a"
+    workspaceId = "ws-a"
+    break;  // 只取第一个！
+  结果：workspaceId = "ws-a"
+
+Step 2: 分类事件
+  第 1 个事件 (open):
+    switch default → immediateEvents.push(event)  // ✅ 无校验
+  第 2 个事件 (click):
+    switch default → immediateEvents.push(event)  // ⚠️ 无校验！
+  结果：immediateEvents = [event1, event2]
+
+Step 3: 延迟事件回填
+  无延迟事件 → 跳过
+  结果：backfilledDelayedEvents = []
+
+Step 4: 签名验证
+  查询 ws-a 的 webhookKey
+  使用 ws-a 的密钥验证签名
+  假设签名有效（请求确实来自 SendGrid）
+  结果：verified = true
+
+Step 5: 合流写入
+  submitSendgridEvents({
+    workspaceId: "ws-a",  // ⚠️ 单一值
+    events: [event1, event2],  // 两个事件
+  })
+
+  → insertUserEvents(workspaceId = "ws-a", ...)
+```
+
+**最终结果**：
+
+| 事件 | 原始 workspaceId | 实际写入 workspace_id | 结果 |
+|------|-----------------|----------------------|------|
+| User A 的 open | ws-a | ws-a | ✅ 正确 |
+| User B 的 click | ws-b | ws-a | ❌ **误写！** |
+
+**后果**：
+- Workspace B 的事件被错误地写入到 Workspace A
+- Workspace A 的分析中会出现不属于它的用户行为数据
+- Workspace B 缺失了自己的 `click` 事件
+- 计费统计、用户画像、旅程分析都会受到影响
+
+#### 场景 E：父子工作空间 Immediate Events 混合
+
+**严重级别**：🟡 中（数据归属错误）
+
+**前提条件**：
+- Parent 工作空间 P 有子工作空间 C1、C2
+- C1 和 C2 使用同一个 Webhook 端点配置
+
+**触发条件**：
+- C1 的 `delivered` 事件和 C2 的 `open` 事件同批次到达
+
+**结果**：
+- 如果 C1 的事件先被遍历，`workspaceId = ws-c1`
+- C2 的事件会被写入到 ws-c1
+- 父工作空间查询时，`buildWorkspaceIdClause` 会返回 `IN (ws-c1, ws-c2)`
+- 所以在 Parent 层面可能看不到问题
+- 但在子工作空间层面，C2 会缺失自己的事件
+
+#### 场景 F：Immediate + Delayed 混合事件（对照）
+
+**说明**：此场景验证 delayed events 确实有校验
+
+**前提条件**：
+- Workspace A 的 `open` 事件（immediate）
+- Workspace B 的 `bounce` 事件（delayed）
+
+**执行流程**：
+```
+Step 1: workspaceId = "ws-a"（从 A 的 open 事件）
+
+Step 2: 分类
+  A 的 open → immediateEvents
+  B 的 bounce → delayedEvents (smtp-id = bounce-b)
+
+Step 3: 延迟事件回填
+  查询 processed:bounce-b
+  假设是 B 的事件 → processedWorkspaceId = "ws-b"
+  校验：ws-a !== ws-b → continue（跳过）
+
+Step 4: 写入
+  只有 A 的 open 事件被写入（workspaceId = ws-a）
+```
+
+**结果**：
+- ✅ B 的 bounce 事件被正确过滤（不会被写入 A）
+- ⚠️ 但 B 的 bounce 事件也没有被写入 B（丢失）
+- 延迟事件有校验，不会误写，但可能丢失
+
+### 11.11 现有校验缺口分析
+
+#### 缺口 1：Immediate Events 无 workspaceId 校验
+
+**位置**：`packages/backend-lib/src/destinations/sendgrid.ts:244-265`
+
+```typescript
+for (const event of sendgridEvents) {
+  switch (event.event) {
+    case "spamreport":
+    case "bounce":
+      // ... 延迟事件处理
+      break;
+    default:
+      // ⚠️ 直接加入数组，不校验 event.workspaceId
+      immediateEvents.push(event);
+      break;
+  }
+}
+```
+
+**问题**：
+- `delayedEvents` 的后续处理有 `processedWorkspaceId` 校验
+- `immediateEvents` 没有任何校验
+- 不一致的处理逻辑
+
+#### 缺口 2：写入时使用推断值而非事件内部值
+
+**位置**：`packages/backend-lib/src/destinations/sendgrid.ts:364-367`
+
+```typescript
+await submitSendgridEvents({
+  workspaceId,  // 推断的单一值
+  events: [...immediateEvents, ...backfilledDelayedEvents],
+});
+```
+
+**问题**：
+- `sendgridEventToDF` 会从事件中提取 `workspaceId` 放入 `properties`
+- 但 `submitBatch` 使用的是单独传入的 `workspaceId`
+- 两者可能不一致
+
+#### 缺口 3：签名验证不按事件分组
+
+**位置**：`packages/backend-lib/src/destinations/sendgrid.ts:319-354`
+
+**问题**：
+- 签名验证使用推断出的 `workspaceId` 对应的密钥
+- 如果批次中有多个 workspace 的事件，只验证一个密钥
+- 理论上，另一个 workspace 的事件应该用自己的密钥验证
+
+**但实际上**：
+- SendGrid Webhook 是按整个 HTTP 请求签名的
+- 不是按事件签名
+- 所以这个设计是合理的
+- 但前提是：同一批次的事件应该来自同一个 workspace
+
+### 11.12 可落地的修复方案
+
+#### 方案 B（推荐）：校验 Immediate Events 的 workspaceId 一致性
+
+**复杂度**：低
+**安全性**：✅ 高
+**数据完整性**：⚠️ 中（不一致事件会被丢弃）
+
+**设计思路**：
+- 与 `delayedEvents` 的处理方式一致
+- 在分类 `immediateEvents` 时校验 `event.workspaceId`
+- 不一致则跳过并记录 warning
+
+**代码改动**（`packages/backend-lib/src/destinations/sendgrid.ts`）：
+
+```typescript
+// Step 1: 先收集所有有 workspaceId 的事件
+const eventWorkspaceIds = sendgridEvents
+  .map(e => e.workspaceId)
+  .filter(Boolean) as string[];
+const uniqueWorkspaceIds = [...new Set(eventWorkspaceIds)];
+
+if (uniqueWorkspaceIds.length > 1) {
+  logger().warn(
+    {
+      workspaceIds: uniqueWorkspaceIds,
+      eventCount: sendgridEvents.length,
+    },
+    "Multiple workspaceIds found in same SendGrid webhook batch. Events with mismatched workspaceId will be skipped.",
+  );
+}
+
+// Step 2: 分类时校验
+for (const event of sendgridEvents) {
+  switch (event.event) {
+    case "spamreport":
+    case "bounce":
+      // ... 延迟事件处理（保持不变）
+      break;
+    default:
+      // 新增：校验 immediate event 的 workspaceId
+      if (workspaceId && event.workspaceId && event.workspaceId !== workspaceId) {
+        logger().warn(
+          {
+            expectedWorkspaceId: workspaceId,
+            actualWorkspaceId: event.workspaceId,
+            eventType: event.event,
+            sgMessageId: event.sg_message_id,
+            email: event.email,
+          },
+          "Immediate event workspaceId mismatch, skipping",
+        );
+        continue;  // 跳过不一致的事件
+      }
+      immediateEvents.push(event);
+      break;
+  }
+}
+```
+
+**优点**：
+1. 与现有 `delayedEvents` 处理逻辑一致
+2. 最小化代码改动（约 20 行）
+3. 安全性最高——不一致的事件直接跳过
+4. 有日志，便于排查问题
+
+**缺点**：
+- 如果确实有跨 workspace 批量事件，部分事件会丢失
+- 但这是正确的行为——应该是配置问题（共享 Webhook），应该告警
+
+#### 方案 A（备选）：按 workspaceId 分组独立处理
+
+**复杂度**：高
+**安全性**：✅ 高
+**数据完整性**：✅ 高
+
+**设计思路**：
+1. 将事件按 `workspaceId` 分组
+2. 对每组：
+   - 独立查找对应的 `webhookKey`
+   - 独立签名验证
+   - 独立写入
+
+**优点**：
+- 即使配置了共享 Webhook，也能正确处理
+- 数据不会丢失
+
+**缺点**：
+- 需要大幅重构现有逻辑
+- 签名验证逻辑复杂（需要为每个组查找密钥）
+- 如果有延迟事件，需要为每个组独立查询 `processed` 事件
+- 改动风险较高
+
+#### 方案 C（不推荐）：使用事件内部的 workspaceId 写入
+
+**复杂度**：中
+**安全性**：⚠️ 中
+**数据完整性**：✅ 高
+
+**设计思路**：
+- 在 `submitSendgridEvents` 中，不使用统一的 `workspaceId`
+- 而是逐个事件使用 `event.workspaceId`
+
+**问题**：
+- 签名验证仍然只验证一个 `workspaceId`
+- 如果事件来自其他 workspace，其事件的签名合法性无法验证
+- 可能被利用注入伪造事件
+
+### 11.13 修复建议优先级
+
+| 优先级 | 修复项 | 影响范围 | 实施难度 |
+|--------|--------|---------|---------|
+| P0 | 方案 B：校验 immediate events 的 workspaceId | 安全性 | 低 |
+| P1 | 增强错误日志和监控 | 可观测性 | 低 |
+| P2 | 签名验证前置（如果有 immediate events） | 性能/安全 | 中 |
+| P3 | 方案 A：按 workspaceId 分组处理 | 完整性 | 高 |
+
 ---
 
 ## 十二、关键代码文件索引
@@ -1650,4 +2098,6 @@ if (workspaceId !== processedWorkspaceId) {
 | workspaceId 提取逻辑 | packages/api/src/workspace.ts |
 | 事件提交封装 | packages/backend-lib/src/apps.ts |
 | 用户查询（正确父子模式参考） | packages/backend-lib/src/users.ts |
+| SendGrid 邮件发送与 Webhook 处理 | packages/backend-lib/src/destinations/sendgrid.ts |
+| 常量定义（MESSAGE_METADATA_FIELDS） | packages/backend-lib/src/constants.ts |
 | 类型定义 | packages/isomorphic-lib/src/types.ts |
