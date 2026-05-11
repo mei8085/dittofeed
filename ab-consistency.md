@@ -75,6 +75,62 @@ argMax(segment_value, assigned_at) as latest_segment_value
 
 这确保即使有多个 Worker 写入，读取时也能获取到最新的一致状态。
 
+#### 3.1.4 多 Worker 并发写入的可见性窗口
+
+当多个 Worker 并发处理同一用户时，系统通过以下机制确保数据一致性：
+
+**1. 写入等待机制 (`wait_end_of_query`)**
+
+在 `insertSegmentAssignments()` 函数中（`packages/backend-lib/src/segments.ts` 第 1023-1040 行），写入操作使用 `wait_end_of_query: 1` 设置：
+
+```typescript
+await client.insert({
+  table: "computed_property_assignments_v2",
+  values: assignments,
+  format: "JSONEachRow",
+  clickhouse_settings: { wait_end_of_query: 1 },
+});
+```
+
+这确保：
+- 写入操作同步等待数据完全插入
+- 函数返回时，数据已对后续查询可见
+- 避免了"写入后立即读取但数据未可见"的竞态条件
+
+**2. 去重前后的可见性窗口**
+
+ClickHouse MergeTree 引擎的去重机制分为两个阶段：
+
+**阶段一：写入后立即可见（查询时去重）**
+- 数据写入后立即对查询可见
+- 即使有重复行，`argMax` 聚合函数会在查询时自动选择最新版本
+- 这是"最终一致性"的关键保障
+
+**阶段二：后台合并去重**
+- ClickHouse 后台定期执行合并操作
+- 合并时会删除重复行，只保留最新版本
+- 这个过程是异步的，不影响查询结果的正确性
+
+**可见性时间线示例：**
+
+```
+时间轴 →
+T0: Worker A 和 Worker B 同时开始处理用户 X
+T1: Worker A 完成计算，写入 (segment_value=true, assigned_at=T1)
+    → 数据立即可见，查询返回 true
+T2: Worker B 完成计算，写入 (segment_value=true, assigned_at=T2)
+    → 数据立即可见，存在两行记录
+T3: 查询执行 argMax(segment_value, assigned_at)
+    → 返回 T2 对应的 true（最新版本）
+T4: ClickHouse 后台合并完成
+    → 只保留 T2 的记录，查询仍然返回 true
+```
+
+**关键保证：**
+- 即使存在重复行，`argMax` 始终返回正确的最新状态
+- 去重前后查询结果一致
+- 唯一的区别是存储效率，而非结果正确性
+
 ### 3.2 计算层面的一致性
 
 #### 3.2.1 确定性计算
