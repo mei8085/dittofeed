@@ -22,79 +22,78 @@ DittoFeed 采用 ClickHouse + PostgreSQL 双数据库架构，实现不同数据
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        阶段一：事件写入 ClickHouse                        │
+│                     阶段一：事件写入 ClickHouse                          │
 │                                                                         │
 │  目标表：user_events_v2（MergeTree）                                     │
 │  写入模式：ch-sync / ch-async / kafka                                   │
-│  物化视图：自动派生到 internal_events、group_user_assignments 等表       │
+│  写入字段：processing_time = now（服务端处理时间戳）                      │
 │                                                                         │
-│  幂等保证：                                                              │
+│  幂等层：                                                                │
 │    ┌─ 应用层：messageId 唯一标识                                         │
 │    ├─ 查询层：argMax + GROUP BY 去重                                    │
-│    └─ 引擎层：MergeTree 稀疏索引，同 ORDER BY 键数据有序                  │
+│    └─ 引擎层：MergeTree 按 ORDER BY 有序存储                            │
 │                                                                         │
-│  失败恢复：                                                              │
-│    ┌─ Kafka 模式：消息队列回溯                                           │
-│    ├─ 同步/异步模式：依赖调用方重试                                      │
-│    └─ messageId 保证重复提交无害                                         │
+│  恢复点：无 Period 表，依赖调用方重试 + messageId 保证幂等               │
 └─────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼ 定时调度（每 2 分钟）
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        阶段二：计算中间状态                              │
+│                      阶段二：计算中间状态（computeState）                 │
 │                                                                         │
 │  目标表：computed_property_state_v3（AggregatingMergeTree）             │
-│  处理：computeState()                                                   │
+│  时间边界：processing_time >= periodBound                               │
+│  写入字段：computed_at = now                                            │
 │                                                                         │
-│  幂等保证：                                                              │
-│    ┌─ State 引擎：argMaxState、uniqState 幂等聚合                       │
-│    ├─ Period 表：记录已处理的时间范围                                   │
-│    └─ lowerBoundClause：只处理 period.maxTo 之后的事件                  │
+│  幂等层：                                                                │
+│    ┌─ 引擎层：AggregatingMergeTree + argMaxState/uniqState              │
+│    ├─ 进度层：Period 表记录 maxTo（now）                                │
+│    └─ 查询层：lowerBoundClause 只处理 periodBound 之后的事件             │
 │                                                                         │
-│  失败恢复：                                                              │
-│    ┌─ Postgres 的 ComputedPropertyPeriod 表持久化进度                   │
-│    ├─ 下次调度从 periodBound（maxTo）继续                                │
-│    └─ 只增量处理新事件，不重复计算                                       │
+│  恢复点：periodBound = 上一轮 Period.maxTo                              │
+│          只处理 processing_time >= periodBound 的事件                    │
 └─────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        阶段三：计算属性赋值                              │
+│                   阶段三：计算属性赋值（computeAssignments）              │
 │                                                                         │
 │  目标表：computed_property_assignments_v2（ReplacingMergeTree）         │
-│  处理：computeAssignments()                                             │
+│  时间边界：computed_at >= periodBound（针对 state_v3）                  │
+│  写入字段：assigned_at = now                                            │
 │                                                                         │
-│  幂等保证：                                                              │
+│  幂等层：                                                                │
 │    ┌─ 引擎层：ReplacingMergeTree 自动去重同 ORDER BY 键记录              │
-│    ├─ Period 表：按时间范围增量                                          │
-│    └─ shouldReset：定义更新时重置重新计算                                │
+│    ├─ 进度层：Period 表记录 maxTo（now）                                │
+│    └─ 版本层：shouldReset 判断定义是否更新                               │
 │                                                                         │
-│  失败恢复：                                                              │
-│    ┌─ Period 表的 maxTo 记录已处理截止时间                              │
-│    ├─ lowerBoundClause 避免重复处理                                     │
-│    └─ ReplacingMergeTree 重复写入取最新版本                             │
+│  恢复点：periodBound = 上一轮 Period.maxTo                              │
+│          只处理 computed_at >= periodBound 的状态记录                    │
 └─────────────────────────────────────────────────────────────────────────┘
                                       │
                                       ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                        阶段四：处理赋值（触发下游）                       │
+│                   阶段四：处理赋值（processAssignments）                  │
 │                                                                         │
 │  目标表：processed_computed_properties_v2（ReplacingMergeTree）         │
-│  处理：processAssignments()                                             │
+│  时间边界：assigned_at >= periodBound                                   │
+│             └─ 但仅当 periodBound > processedForUpdatedAt 时启用        │
+│  写入字段：processed_at = now                                           │
 │                                                                         │
-│  下游触发：                                                              │
-│    ┌─ Journey（旅程）：进入/退出节点触发                                 │
-│    └─ Integration（集成）：HubSpot 等第三方同步                          │
+│  执行顺序：                                                              │
+│    1. Promise.all([                                                      │
+│         triggerSegmentEntryJourney(),    // 触发 Journey 下游           │
+│         startHubspotUserIntegration()    // 触发 Integration 下游        │
+│       ])                                                                 │
+│    2. await insertProcessedComputedProperties()  // 写入处理记录         │
 │                                                                         │
-│  幂等保证：                                                              │
-│    ┌─ LEFT ANY JOIN pcp 表过滤已处理的赋值                              │
-│    ├─ processed_for + processed_for_type 区分不同处理目标               │
-│    └─ 按 user_id 游标分页，cursor = lastUserId                          │
+│  幂等层：                                                                │
+│    ┌─ 去重表：pcp 表记录已处理的 user_id + 值                            │
+│    ├─ JOIN 过滤：LEFT ANY JOIN pcp 过滤已处理                            │
+│    ├─ 值变化检测：cpa.value != pcp.value 只处理变化                      │
+│    └─ 进度层：Period 表记录 maxTo（now）                                │
 │                                                                         │
-│  失败恢复：                                                              │
-│    ┌─ pcp 表记录已处理的 user_id + 值                                   │
-│    ├─ 下次处理时 JOIN 过滤，只处理值变化的 user                         │
-│    └─ Period 表记录已处理的 assigned_at 范围                             │
+│  恢复点：periodBound = 上一轮 Period.maxTo                              │
+│          + pcp 表记录已处理值（双重保障）                                 │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -316,6 +315,76 @@ export const computedPropertyType = pgEnum("ComputedPropertyType", [
 
 ## 五、协同写入链路的幂等与恢复详解
 
+### 5.0 关键概念：Period 表
+
+在深入各阶段之前，先理解 Postgres 中 Period 表的作用：
+
+**Postgres Period 表结构**：
+
+```typescript
+// db/schema.ts:200-220
+export const computedPropertyPeriod = pgTable(
+  "ComputedPropertyPeriod",
+  {
+    id: uuid().primaryKey().defaultRandom().notNull(),
+    workspaceId: uuid().notNull(),
+    type: computedPropertyType().notNull(),
+    computedPropertyId: uuid().notNull(),
+    from: timestamp({ withTimezone: true, mode: "string" }),  // 上一轮的 to
+    to: timestamp({ withTimezone: true, mode: "string" }).notNull(),  // 本轮的 now
+    step: computedPropertyStep().notNull(),  // "ComputeState" | "ComputeAssignments" | "ProcessAssignments"
+    version: text().notNull(),  // definitionUpdatedAt.toString()
+    createdAt: timestamp(...).defaultNow().notNull(),
+  },
+  ...
+);
+```
+
+**Period 查询逻辑**（getPeriodsByComputedPropertyId）：
+
+```typescript
+// periods.ts:166-182
+SELECT DISTINCT ON (workspaceId, type, computedPropertyId)
+  type,
+  computedPropertyId,
+  version,
+  MAX(to) OVER (
+    PARTITION BY workspaceId, type, computedPropertyId
+  ) as maxTo
+FROM ComputedPropertyPeriod
+WHERE step = ${step}
+ORDER BY workspaceId, type, computedPropertyId, to DESC
+```
+
+- 每个 step（ComputeState / ComputeAssignments / ProcessAssignments）独立维护进度
+- 返回的是 **当前 version** 的 maxTo（version 来自 definitionUpdatedAt）
+- `get({ version, computedPropertyId })` 按 version 匹配
+
+**Period 创建逻辑**（createPeriods）：
+
+```typescript
+// periods.ts:213-229
+for (const segment of segments) {
+  const version = segment.definitionUpdatedAt.toString();
+  const previousPeriod = periodByComputedPropertyId?.get({
+    version,
+    computedPropertyId: segment.id,
+  });
+  newPeriods.push({
+    from: previousPeriod ? previousPeriod.maxTo : null,  // 上一轮的 to
+    to: nowD,                                              // 本轮的 now
+    version,
+    ...
+  });
+}
+```
+
+- `from` = 上一轮同 version 的 `to`
+- `to` = 本轮调度开始时的 `now`
+- 每轮结束时写入 Postgres
+
+---
+
 ### 5.1 阶段一：事件写入 ClickHouse
 
 #### 5.1.1 写入流程
@@ -327,11 +396,16 @@ export const computedPropertyType = pgEnum("ComputedPropertyType", [
 生成 messageId（UUID）
     │
     ▼
-writeMode 判断
+写入 user_events_v2：
+    processing_time = now64(3)  // 服务端处理时间戳
+    message_raw = 原始 JSON
+    message_id = UUID
     │
-    ├─ kafka → 写入 Kafka 主题（由消费者异步消费到 CH）
-    ├─ ch-async → ClickHouse async_insert（服务端异步缓冲）
-    └─ ch-sync → ClickHouse 同步写入（wait_end_of_query=1）
+    ▼
+物化视图自动派生：
+    internal_events_mv → internal_events
+    group_user_assignments_mv → group_user_assignments
+    ...
 ```
 
 #### 5.1.2 幂等机制
@@ -370,7 +444,7 @@ messageIdClause = `
 | `ch-async` | 客户端成功但服务端失败 | 需调用方重试，messageId 保证幂等 |
 | `ch-sync` | 网络超时/服务端错误 | 调用方重试，messageId 保证幂等 |
 
-> **关键点**：阶段一没有 Period 表，依赖 messageId 保证重复提交无害。事件一旦写入成功，后续阶段从 ClickHouse 读取。
+> **关键点**：阶段一没有 Period 表。事件一旦写入成功，后续阶段从 ClickHouse 读取 `processing_time` 作为时间锚点。
 
 ---
 
@@ -381,31 +455,44 @@ messageIdClause = `
 ```
 定时调度器触发（每 2 分钟）
     │
+    ├─ now = 当前时间戳
+    │
     ▼
 从 Postgres 读取 Segments/UserProperties 定义
     │
     ▼
-从 Period 表读取上一轮进度
-    period = periodByComputedPropertyId.get()
-    periodBound = period?.maxTo.getTime()
+从 Postgres Period 表读取上一轮进度：
+    period = getPeriodsByComputedPropertyId(step="ComputeState")
+    periodBound = period?.maxTo.getTime()  // 上一轮的 to
     │
     ▼
 构建 lowerBoundClause：
-    period > 0 ? `processing_time >= ${periodBound}` : ""
+    period > 0
+        ? `and processing_time >= toDateTime64(${periodBound / 1000}, 3)`
+        : ""  // 冷启动，无边界
     │
     ▼
 INSERT INTO computed_property_state_v3
-SELECT ... FROM user_events_v2
-WHERE processing_time <= now
-  AND processing_time >= periodBound（如果有）
+SELECT
+  ...
+  argMaxState(last_value, ue.event_time),
+  uniqState(unique_value),
+  ...
+  toDateTime64(${now / 1000}, 3) as computed_at  // 本轮 now
+FROM user_events_v2 ue
+WHERE
+  workspace_id = ${workspaceId}
+  AND processing_time <= toDateTime64(${now / 1000}, 3)  // 截止到 now
+  AND (${lowerBoundClause})  // 从 periodBound 开始
   AND (segment/property 条件)
+GROUP BY ...
     │
     ▼
-写入 Postgres Period 表
-    from = 上一轮的 to
-    to = now
+写入 Postgres Period 表：
     step = "ComputeState"
-    onConflictDoNothing()
+    from = previousPeriod?.maxTo  // 上一轮的 to
+    to = now  // 本轮的 now
+    version = segment.definitionUpdatedAt.toString()
 ```
 
 #### 5.2.2 幂等机制
@@ -413,8 +500,13 @@ WHERE processing_time <= now
 | 层级 | 机制 | 实现位置 |
 |-----|------|---------|
 | **表引擎** | AggregatingMergeTree | `userEvents/clickhouse.ts:572` |
-| **聚合函数** | argMaxState、uniqState | `computePropertiesIncremental.ts:3129-3132` |
+| **聚合函数** | argMaxState、uniqState 幂等聚合 | `computePropertiesIncremental.ts:3129-3132` |
 | **进度跟踪** | Period 表 + lowerBoundClause | `computePropertiesIncremental.ts:3094-3097` |
+
+**时间边界口径**：
+- **过滤条件**：`processing_time >= periodBound`（针对 user_events_v2）
+- **截止条件**：`processing_time <= now`
+- **写入字段**：`computed_at = now`
 
 **AggregatingMergeTree 幂等**：
 
@@ -442,45 +534,32 @@ ORDER BY (workspace_id, type, computed_property_id, state_id, user_id, truncated
 
 #### 5.2.3 失败恢复
 
-**Postgres Period 表结构**：
-
-```typescript
-// db/schema.ts:200-220
-export const computedPropertyPeriod = pgTable(
-  "ComputedPropertyPeriod",
-  {
-    id: uuid().primaryKey().defaultRandom().notNull(),
-    workspaceId: uuid().notNull(),
-    type: computedPropertyType().notNull(),
-    computedPropertyId: uuid().notNull(),
-    from: timestamp({ withTimezone: true, mode: "string" }),
-    to: timestamp({ withTimezone: true, mode: "string" }).notNull(),
-    step: computedPropertyStep().notNull(),  // "ComputeState" | "ComputeAssignments" | "ProcessAssignments"
-    version: text().notNull(),  // definitionUpdatedAt.toString()
-    createdAt: timestamp(...).defaultNow().notNull(),
-  },
-  ...
-);
-```
-
-**恢复流程**：
-
 ```
 本次调度失败（computeState 抛出异常）
     │
-    │ 此时 Postgres Period 表还未更新
-    │ createPeriods 在 computeState 最后执行
+    │ 此时：
+    │   - computed_property_state_v3 可能已部分写入
+    │   - Postgres Period 表还未更新
+    │   - createPeriods 在 computeState 最后执行
     │
     ▼
 下次调度
     │
+    ├─ now' = 新的当前时间戳
     ├─ getPeriodsByComputedPropertyId() → 返回上一轮成功的 Period
-    ├─ periodBound = 上一轮成功的 maxTo
-    ├─ lowerBoundClause 过滤已处理的事件
-    └─ 从断点继续增量计算
+    ├─ periodBound = 上一轮成功的 maxTo（没变）
+    ├─ lowerBoundClause = `processing_time >= ${periodBound}`
+    ├─ 截止条件 = `processing_time <= now'`
+    │
+    ├─ 重复处理范围：[periodBound, now) 区间内的事件
+    │   └─ 但 AggregatingMergeTree + 幂等聚合函数保证结果一致
+    │
+    └─ 新增处理范围：[now, now') 区间内的新事件
 ```
 
-> **关键点**：Period 写入在阶段最后。如果中间失败，下次从上次成功的 periodBound 继续。
+> **关键点**：
+> 1. Period 写入在阶段最后。如果中间失败，下次从断点继续
+> 2. 重复处理 [periodBound, now) 区间是安全的：幂等聚合函数 + AggregatingMergeTree 保证最终一致
 
 ---
 
@@ -489,27 +568,41 @@ export const computedPropertyPeriod = pgTable(
 #### 5.3.1 处理流程
 
 ```
-从 Period 表读取 ComputeAssignments 进度
+从 Postgres Period 表读取进度：
+    period = getPeriodsByComputedPropertyId(step="ComputeAssignments")
     periodBound = period?.maxTo.getTime()
     │
     ├─ 是否需要重置？
-    │   shouldReset = definitionUpdatedAt > periodBound（定义更新了）
-    │   └─ 是 → 全量重新计算
+    │   shouldReset = definitionUpdatedAt > periodBound
+    │       && definitionUpdatedAt <= now
+    │       && definitionUpdatedAt > createdAt
+    │   ├─ 是 → lowerBoundClause = ""（全量重算）
+    │   └─ 否 → 继续增量计算
     │
     ▼
-构建 lowerBoundClause：
-    getLowerBoundClause(periodBound)
+构建 lowerBoundClause（针对 computed_property_state_v3）：
+    function getLowerBoundClause(bound?: number): string {
+      return bound && bound > 0
+        ? `and computed_at >= toDateTime64(${bound / 1000}, 3)`
+        : "";
+    }
     │
     ▼
 INSERT INTO computed_property_assignments_v2
-SELECT ... FROM resolved_segment_state / resolved_user_property_state
-WHERE computed_at <= now
-  AND state_id IN ...
-  ${lowerBoundClause}
+SELECT
+  ...
+  toDateTime64(${now / 1000}, 3) as assigned_at  // 本轮 now
+FROM resolved_segment_state  // 从 computed_property_state_v3 派生
+WHERE
+  computed_at <= toDateTime64(${now / 1000}, 3)  // 截止到 now
+  ${lowerBoundClause}  // 从 periodBound 开始
     │
     ▼
-写入 Postgres Period 表
+写入 Postgres Period 表：
     step = "ComputeAssignments"
+    from = previousPeriod?.maxTo
+    to = now
+    version = segment.definitionUpdatedAt.toString()
 ```
 
 #### 5.3.2 幂等机制
@@ -520,6 +613,13 @@ WHERE computed_at <= now
 | **进度跟踪** | Period 表 + lowerBoundClause | `computePropertiesIncremental.ts:3295` |
 | **版本控制** | definitionUpdatedAt 触发重置 | `computePropertiesIncremental.ts:3326-3331` |
 
+**时间边界口径**：
+- **过滤条件**：`computed_at >= periodBound`（针对 computed_property_state_v3）
+- **截止条件**：`computed_at <= now`
+- **写入字段**：`assigned_at = now`
+
+> **注意**：这里的 time field 是 `computed_at`（阶段二写入的时间戳），不是 `processing_time`
+
 **ReplacingMergeTree 去重**：
 
 ```sql
@@ -528,7 +628,7 @@ ORDER BY (workspace_id, type, computed_property_id, user_id)
 ```
 
 - 相同 `(workspace_id, type, computed_property_id, user_id)` 的记录
-- 后台合并时只保留最新版本
+- 后台合并时只保留最新版本（`assigned_at` 最大的）
 - 重复插入自动去重
 
 **定义更新检测**：
@@ -558,19 +658,58 @@ function shouldResetComputedProperty({
 #### 5.3.3 失败恢复
 
 ```
+场景 A：正常失败（无定义更新）
+
 本次调度失败
     │
-    │ computeAssignments 抛出异常
     │ Period 表未更新
     │
     ▼
 下次调度
     │
     ├─ periodBound = 上一轮成功的 maxTo
-    ├─ lowerBoundClause = `assigned_at >= ${periodBound}`
-    ├─ 只增量处理新赋值
-    └─ 重复赋值由 ReplacingMergeTree 自动去重
+    ├─ lowerBoundClause = `computed_at >= ${periodBound}`
+    ├─ 只增量处理 computed_at >= periodBound 的状态记录
+    └─ 重复赋值由 ReplacingMergeTree 自动去重（保留 assigned_at 最大的）
 ```
+
+```
+场景 B：定义更新（shouldReset = true）
+
+定义更新：
+    Postgres: definitionUpdatedAt = T_update
+
+本次调度（now = T_now > T_update）
+    │
+    ├─ periodBound = 旧版本的 maxTo（< T_update）
+    ├─ shouldReset = (T_update > periodBound) = true
+    ├─ lowerBoundClause = ""（全量重算）
+    │
+    ├─ INSERT 全量数据到 computed_property_assignments_v2
+    │   └─ 新记录的 assigned_at = T_now（更大）
+    │
+    └─ 写入 Period 表：
+        version = T_update.toString()  // 新版本号
+        to = T_now
+```
+
+```
+场景 C：定义更新后再次调度
+
+下次调度
+    │
+    ├─ currentVersion = T_update.toString()
+    ├─ getPeriodsByComputedPropertyId(version=currentVersion)
+    │   └─ 返回版本 T_update 的 Period
+    ├─ periodBound = T_now（上一轮的 to）
+    ├─ shouldReset = (T_update > T_now) = false
+    ├─ 恢复增量计算
+    └─ lowerBoundClause = `computed_at >= ${T_now}`
+```
+
+> **关键点**：
+> 1. 定义更新会触发全量重算，但 ReplacingMergeTree 保证最终只保留最新版本
+> 2. Period 的 version 与 definitionUpdatedAt 绑定，定义更新后旧 version 的 Period 不再使用
 
 ---
 
@@ -579,13 +718,15 @@ function shouldResetComputedProperty({
 #### 5.4.1 处理流程
 
 ```
-从 Period 表读取 ProcessAssignments 进度
+从 Postgres Period 表读取进度：
+    period = getPeriodsByComputedPropertyId(step="ProcessAssignments")
     periodBound = period?.maxTo.getTime()
     │
     ▼
-构建 AssignmentProcessor 列表（每个 journey/integration 一个）
+构建 AssignmentProcessor 列表（每个 journey/integration 一个）：
     processed_for = journeyId / integrationName
     processed_for_type = "journey" / "integration"
+    processedForUpdatedAt = journey.updatedAt / integration.updatedAt
     │
     ▼
 AssignmentProcessor.process() 分页处理：
@@ -598,27 +739,85 @@ AssignmentProcessor.process() 分页处理：
             LEFT ANY JOIN processed_computed_properties_v2 pcp
                 ON cpa.user_id = pcp.user_id
             WHERE
-                cpa.value != pcp.value  -- 值变化才处理
-                AND assigned_at >= periodBound
+                assigned_at >= periodBound  -- 仅当 periodBound > processedForUpdatedAt
+                AND cpa.value != pcp.value   -- 值变化才处理
         │
         ▼
         processRows(rows)：
-            ├─ Journey：startSegmentEntryWorkflow()
-            └─ Integration：startHubspotUserIntegrationWorkflow()
-        │
-        ▼
-        insertProcessedComputedProperties(assignments)
-            └─ 写入 processed_computed_properties_v2
+            ┌─ 步骤 1：分类
+            │    journeySegmentAssignments / integrationAssignments
+            │
+            ├─ 步骤 2：并行触发下游
+            │    await Promise.all([
+            │      triggerSegmentEntryJourney(),      // 旅程工作流
+            │      startHubspotUserIntegration()      // HubSpot 集成
+            │    ])
+            │
+            └─ 步骤 3：写入处理记录
+                 await insertProcessedComputedProperties({
+                   assignments: processedAssignments
+                 })
         │
         ▼
         cursor = lastUserId
     │
     ▼
-写入 Postgres Period 表
+写入 Postgres Period 表：
     step = "ProcessAssignments"
+    from = previousPeriod?.maxTo
+    to = now
+    version = segment.definitionUpdatedAt.toString()
 ```
 
-#### 5.4.2 幂等机制
+#### 5.4.2 执行顺序（关键！）
+
+**代码实现**（processRowsInner）：
+
+```typescript
+// computePropertiesIncremental.ts:3650-3750
+
+// 步骤 1：分类
+const journeySegmentAssignments: ComputedAssignment[] = [];
+const integrationAssignments: ComputedAssignment[] = [];
+for (const assignment of assignments) {
+  // ...分类到两个数组
+}
+
+// 步骤 2：并行触发下游（Promise.all）
+await Promise.all([
+  ...journeySegmentAssignments.flatMap((assignment) => {
+    return triggerSegmentEntryJourney({...});
+  }),
+  ...integrationAssignments.flatMap(async (assignment) => {
+    return startHubspotUserIntegrationWorkflow({...});
+  }),
+]);
+
+// 步骤 3：写入处理记录（在下游触发之后）
+const processedAssignments: ComputedPropertyAssignment[] =
+  assignments.flatMap((assignment) => ({
+    user_property_value: assignment.latest_user_property_value,
+    segment_value: assignment.latest_segment_value,
+    ...assignment,
+  }));
+
+await insertProcessedComputedProperties({
+  assignments: processedAssignments,
+});
+
+return cursor;
+```
+
+**执行顺序**：
+1. **先**：`Promise.all([下游触发...])`
+2. **后**：`await insertProcessedComputedProperties()`
+
+**语义**：
+- "至少一次"（at-least-once）
+- 如果下游触发成功但 pcp 写入失败：下次调度会重新触发下游
+- 下游系统需要自己处理幂等（如 journey 的消息去重）
+
+#### 5.4.3 幂等机制
 
 | 层级 | 机制 | 实现位置 |
 |-----|------|---------|
@@ -627,6 +826,27 @@ AssignmentProcessor.process() 分页处理：
 | **值变化检测** | `cpa.value != pcp.value` | `computePropertiesIncremental.ts:3899-3900` |
 | **分页游标** | cursor = lastUserId | `computePropertiesIncremental.ts:3951` |
 | **表引擎** | ReplacingMergeTree | `userEvents/clickhouse.ts:407-427` |
+
+**时间边界口径**：
+
+```typescript
+// computePropertiesIncremental.ts:3823-3833
+const period = periodByComputedPropertyId.get({
+  computedPropertyId,
+  version: computedPropertyVersion,
+});
+const periodBound = period?.maxTo.getTime();
+
+// 注意：仅当 periodBound > processedForUpdatedAt 时启用边界
+const lowerBoundClause =
+  periodBound && periodBound > 0 && periodBound > processedForUpdatedAt
+    ? `and assigned_at >= toDateTime64(${periodBound / 1000}, 3)`
+    : "";
+```
+
+- **过滤条件**：`assigned_at >= periodBound`（针对 computed_property_assignments_v2）
+- **限制条件**：仅当 `periodBound > processedForUpdatedAt` 时启用
+- **原因**：如果 journey/integration 被更新过（updatedAt > periodBound），可能需要重新处理旧赋值
 
 **核心去重查询**：
 
@@ -639,7 +859,7 @@ const query = `
            argMax(segment_value, assigned_at) latest_segment_value,
            argMax(user_property_value, assigned_at) latest_user_property_value
     FROM computed_property_assignments_v2
-    WHERE assigned_at >= ${periodBound}  -- 只处理新赋值
+    WHERE assigned_at >= ${periodBound}  -- 只处理新赋值（有限制条件）
     GROUP BY user_id
   ) cpa
   LEFT ANY JOIN (
@@ -647,7 +867,7 @@ const query = `
            argMax(segment_value, processed_at) segment_value,
            argMax(user_property_value, processed_at) user_property_value
     FROM processed_computed_properties_v2
-    WHERE processed_for = ${journeyId}  -- 区分不同处理目标
+    WHERE processed_for = ${journeyId}      -- 区分不同处理目标
       AND processed_for_type = "journey"
     GROUP BY user_id
   ) pcp
@@ -686,9 +906,9 @@ ORDER BY (
 - `processed_for + processed_for_type` 区分不同下游（同一赋值可能触发多个下游）
 - 每个下游独立维护自己的处理进度
 
-#### 5.4.3 失败恢复
+#### 5.4.4 失败恢复
 
-**场景 1：processRows 之前失败**
+**场景 1：下游触发之前失败**
 
 ```
 查询构建失败 / ClickHouse 查询失败
@@ -704,220 +924,276 @@ ORDER BY (
     └─ JOIN pcp 过滤已处理（如果部分页面成功）
 ```
 
-**场景 2：processRows 部分成功后失败**
+**场景 2：部分页面成功后失败**
 
 ```
 第 1 页成功：
-    ├─ 触发 journey 工作流
-    └─ 写入 processed_computed_properties_v2（user_id_1 ~ user_id_100）
+    ├─ 步骤 1：触发 journey 工作流 ✓
+    ├─ 步骤 2：写入 processed_computed_properties_v2 ✓
+    └─ pcp 记录：user_id_1 ~ user_id_100
 
-第 2 页失败
+第 2 页失败（下游触发失败 或 pcp 写入失败）
     │
     │ Period 表还没更新
     │
     ▼
 下次调度
     │
-    ├─ 全量查询（periodBound = 上一轮成功）
+    ├─ periodBound = 上一轮成功的 maxTo
+    ├─ 全量查询（lowerBoundClause 可能启用也可能不启用）
     ├─ JOIN pcp 时，user_id_1 ~ 100 已匹配，被过滤
     ├─ 只处理 user_id_101 之后
     └─ cursor 重新从 null 开始，但实际只处理剩余数据
 ```
 
-**场景 3：下游触发失败但 pcp 已写入**
+**场景 3：下游触发成功但 pcp 写入失败**
 
-```typescript
-// computePropertiesIncremental.ts:3746-3748
-await insertProcessedComputedProperties({
-  assignments: processedAssignments,
-});
+```
+第 1 页：
+    ├─ 步骤 1：triggerSegmentEntryJourney() ✓ （已触发）
+    ├─ 步骤 2：insertProcessedComputedProperties() ✗ （失败）
+    │
+    └─ 结果：下游已触发，但 pcp 没记录
+
+下次调度：
+    │
+    ├─ 同样的赋值会被再次查询（pcp 没记录）
+    ├─ 同样的赋值会被再次处理
+    ├─ 下游会被再次触发
+    │
+    └─ 依赖：下游系统自己处理幂等
+         （如 journey 工作流的消息去重机制）
 ```
 
-如果 `startSegmentEntryWorkflow()` 失败但 `insertProcessedComputedProperties()` 已执行：
-- pcp 表记录了"已处理"
-- 但实际下游没触发
-
-**补偿机制**：值变化检测确保最终一致性。
-
-如果赋值值没有变化，下次调度不会再处理。但如果值变化了，会重新触发。
-
-> **关键点**：processAssignments 是"至少一次"语义。下游系统需要自己处理幂等（如 journey 的消息去重）。
+> **关键点**：
+> 1. 执行顺序：先触发下游，再写入 pcp
+> 2. 语义：至少一次（at-least-once）
+> 3. 下游系统需要自己处理幂等
+> 4. Period 表 + pcp 表双重保障恢复
 
 ---
 
 ### 5.5 幂等与恢复汇总表
 
-| 阶段 | 步骤 | 幂等层 | 恢复点 | 实现 |
-|-----|------|--------|--------|------|
-| **一** | 事件写入 | messageId + MergeTree | 无，依赖调用方重试 | `userEvents.ts` |
-| **二** | computeState | AggregatingMergeTree + Period | `period.maxTo`（processing_time） | `computePropertiesIncremental.ts:3006` |
-| **三** | computeAssignments | ReplacingMergeTree + Period | `period.maxTo`（assigned_at） | `computePropertiesIncremental.ts:3255` |
-| **四** | processAssignments | pcp 表 + ReplacingMergeTree + Period | `period.maxTo` + pcp 记录 | `computePropertiesIncremental.ts:4049` |
+| 阶段 | 步骤 | 时间边界字段 | lowerBoundClause 条件 | 幂等层 | 恢复点 |
+|-----|------|------------|----------------------|--------|--------|
+| **一** | 事件写入 | `processing_time` | 无 | messageId + MergeTree | 无，依赖调用方重试 |
+| **二** | computeState | `processing_time` | `processing_time >= periodBound` | AggregatingMergeTree + Period | `period.maxTo` |
+| **三** | computeAssignments | `computed_at` | `computed_at >= periodBound` | ReplacingMergeTree + Period + shouldReset | `period.maxTo` |
+| **四** | processAssignments | `assigned_at` | `assigned_at >= periodBound`<br>（仅当 `periodBound > processedForUpdatedAt`） | pcp 表 + JOIN 过滤 + 值变化 + Period | `period.maxTo` + pcp 记录 |
 
 ## 六、最终一致性的收敛机制
 
-### 6.1 收敛条件
+### 6.1 各阶段收敛路径串联
 
-双库最终一致性通过以下机制收敛：
-
-**1. Period 表的 monotonic 前进**
-
-```typescript
-// periods.ts:219-229
-newPeriods.push({
-  from: previousPeriod ? previousPeriod.maxTo : null,  // 上一轮的 to
-  to: nowD,                                              // 本轮截止
-  version: segment.definitionUpdatedAt.toString(),       // 定义版本
-  ...
-});
-```
-
-- `from` 永远是上一轮的 `to`
-- `to` 单调递增
-- 不会回退处理已覆盖的时间范围
-
-**2. 定义更新的版本控制**
+#### 阶段一：事件写入 → 阶段二：状态计算
 
 ```
-Postgres 定义：
-    UserProperty {
-      id,
-      definition,
-      definitionUpdatedAt: 1700000000000,  ← 版本号
-      status
-    }
+阶段一写入：
+    user_events_v2:
+        (messageId=1, processing_time=T1)
+        (messageId=2, processing_time=T2)
 
-ClickHouse 赋值：
-    computed_property_assignments_v2 {
-      computed_property_id = id,
-      assigned_at
-    }
+阶段二调度（now=T3）：
+    ├─ periodBound = 0（冷启动）
+    ├─ 处理范围：processing_time <= T3（全部）
+    ├─ 写入 computed_property_state_v3: computed_at=T3
+    └─ 写入 Period 表：to=T3, version=V1
 
-Period 表：
-    ComputedPropertyPeriod {
-      computedPropertyId = id,
-      version = "1700000000000",  ← 版本号匹配
-      maxTo
-    }
+阶段二再次调度（now=T4）：
+    ├─ periodBound = T3
+    ├─ 处理范围：T3 < processing_time <= T4
+    ├─ 只处理新事件（T3 之后写入的）
+    └─ 写入 Period 表：from=T3, to=T4
 ```
 
-- `version = definitionUpdatedAt.toString()` 关联定义版本
-- 定义更新时，`shouldReset` 触发全量重算
-- 旧版本 Period 被忽略，只处理当前版本
+**收敛点**：`period.maxTo` 单调递增，不会回退
 
-**3. processed_computed_properties_v2 的值快照**
+---
 
-```
-用户 A 在 Segment S 中的状态变化：
-
-时间点 | assigned_at | segment_value | processed (journey J)
--------|-------------|---------------|---------------------
-  t1   |   t1        |    true       | 已触发进入
-  t2   |   t2        |    false      | 已触发退出
-  t3   |   t3        |    true       | 已触发重新进入
-```
-
-pcp 表记录每个 `(user_id, processed_for)` 的最后值：
-- `argMax(segment_value, processed_at)` 取最新值
-- 下次比较时，如果值没变化则跳过
-- 保证每个值变化只触发一次下游（或多次但值一致）
-
-### 6.2 收敛流程示例
-
-**场景：定义更新 → 全量重算 → 下游触发**
+#### 阶段二：状态计算 → 阶段三：属性赋值
 
 ```
-┌─ Postgres ──────────────────────────────────────────────────┐
-│                                                             │
-│  时刻 0: 定义创建                                            │
-│    definitionUpdatedAt = 0                                  │
-│    status = Running                                         │
-│                                                             │
-│  时刻 3: 定义更新                                           │
-│    definitionUpdatedAt = 3 ← 版本更新                      │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼ 读取定义
-┌─ Period 表（Postgres） ─────────────────────────────────────┐
-│                                                             │
-│  ComputeAssignments Periods:                                │
-│    [version="0", maxTo=1]   ← 旧版本，处理到 t1             │
-│    [version="0", maxTo=2]   ← 旧版本，处理到 t2             │
-│                                                             │
-│  时刻 3 调度：                                               │
-│    currentVersion = "3"                                     │
-│    period = getPeriod(version="3") → null                  │
-│    periodBound = 0                                          │
-│    shouldReset = (3 > 0) = true                             │
-│                                                             │
-│  全量计算后：                                                │
-│    [version="3", maxTo=4] ← 新版本，从 0 全量重算到 t4     │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼ 全量重算
-┌─ computed_property_assignments_v2（ClickHouse） ────────────┐
-│                                                             │
-│  t1 之前的赋值：                                              │
-│    (user_A, segment_value=true, assigned_at=t1)             │
-│    (user_B, segment_value=false, assigned_at=t1)            │
-│                                                             │
-│  t3 全量重算后：                                              │
-│    (user_A, segment_value=true, assigned_at=t4)  ← 替换旧值  │
-│    (user_B, segment_value=true,  assigned_at=t4)  ← 替换旧值  │
-│    (user_C, segment_value=false, assigned_at=t4) ← 新增     │
-│                                                             │
-│  ReplacingMergeTree 合并后：                                  │
-│    每个 user 只保留 assigned_at 最大的记录                   │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼ 检测值变化
-┌─ processed_computed_properties_v2（ClickHouse） ────────────┐
-│                                                             │
-│  processed_for = journey_J                                   │
-│                                                             │
-│  t3 之前的记录：                                             │
-│    (user_A, segment_value=true, processed_at=t1)            │
-│    (user_B, segment_value=false, processed_at=t1)           │
-│                                                             │
-│  t4 时的 JOIN 比较：                                         │
-│    user_A: true == true → 跳过                              │
-│    user_B: true != false → 触发（状态变化）                  │
-│    user_C: 无记录 → 触发（新增）                             │
-│                                                             │
-│  写入新记录：                                                │
-│    (user_B, segment_value=true, processed_at=t4)            │
-│    (user_C, segment_value=false, processed_at=t4)           │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-                    最终状态收敛一致
+阶段二写入：
+    computed_property_state_v3:
+        (user_A, state=X, computed_at=T3)
+        (user_B, state=Y, computed_at=T3)
+
+阶段三调度（now=T3）：
+    ├─ periodBound = 0（冷启动）
+    ├─ 处理范围：computed_at <= T3（全部）
+    ├─ 写入 computed_property_assignments_v2: assigned_at=T3
+    └─ 写入 Period 表：to=T3, version=V1
+
+阶段二再次调度（now=T4）：
+    ├─ 写入新状态：computed_at=T4
+
+阶段三再次调度（now=T4）：
+    ├─ periodBound = T3
+    ├─ 处理范围：T3 < computed_at <= T4
+    ├─ 只处理新状态
+    └─ 写入 Period 表：from=T3, to=T4
 ```
 
-### 6.3 收敛时间线
+**收敛点**：`computed_at >= periodBound` 只增量处理新状态
+
+---
+
+#### 阶段三：属性赋值 → 阶段四：赋值处理
 
 ```
-时刻 0: 定义创建
-          ↓
-时刻 1: 第一轮调度（ComputeState → ComputeAssignments → ProcessAssignments）
-          ↓ Period(0, 1)
-时刻 2: 第二轮调度
-          ↓ Period(1, 2)
-时刻 3: 定义更新（definitionUpdatedAt = 3）
-          ↓
-时刻 4: 第三轮调度
-          ├─ shouldReset = true
-          ├─ 全量重算（不使用 lowerBound）
-          └─ Period(0, 4)  ← 覆盖整个时间线
-          ↓
-时刻 5: 第四轮调度
-          ├─ currentVersion = "3"
-          ├─ periodBound = 4
-          ├─ 增量计算（4 → 5）
-          └─ Period(4, 5)  ← 恢复单调递增
+阶段三写入：
+    computed_property_assignments_v2:
+        (user_A, segment_value=true, assigned_at=T3)
+        (user_B, segment_value=false, assigned_at=T3)
+
+阶段四调度（now=T3）：
+    ├─ periodBound = 0（冷启动）
+    ├─ lowerBoundClause 可能启用也可能不启用
+    │   （取决于 periodBound > processedForUpdatedAt）
+    ├─ JOIN pcp（空）→ 全部需要处理
+    │
+    ├─ 步骤 1：触发下游（journey / integration）
+    ├─ 步骤 2：写入 pcp: processed_at=T3
+    │       (user_A, segment_value=true, processed_for=J1)
+    │       (user_B, segment_value=false, processed_for=J1)
+    │
+    └─ 写入 Period 表：to=T3
+
+阶段三再次调度（now=T4）：
+    ├─ 写入新赋值：
+    │   (user_A, segment_value=false, assigned_at=T4)  ← 变化
+    │   (user_C, segment_value=true, assigned_at=T4)   ← 新增
+
+阶段四再次调度（now=T4）：
+    ├─ periodBound = T3
+    ├─ lowerBoundClause 可能启用
+    │
+    ├─ JOIN pcp 比较：
+    │   user_A: false != true → 触发（变化）
+    │   user_B: false == false → 跳过
+    │   user_C: 无记录 → 触发（新增）
+    │
+    ├─ 触发下游（user_A 和 user_C）
+    ├─ 写入 pcp 新值
+    │
+    └─ 写入 Period 表：from=T3, to=T4
+```
+
+**收敛点**：
+1. `cpa.value != pcp.value` 只处理值变化
+2. `assigned_at >= periodBound`（有限制条件）只处理新赋值
+3. 双重过滤保证不会重复处理
+
+---
+
+### 6.2 定义更新时的收敛路径
+
+```
+初始状态：
+    Postgres:
+        UserProperty: definitionUpdatedAt=V0 (0)
+    Period:
+        [version=V0, maxTo=T1]
+        [version=V0, maxTo=T2]
+
+时刻 T3：定义更新
+    Postgres:
+        definitionUpdatedAt=V3 (T3)
+
+时刻 T4：调度（now=T4）
+    │
+    ├─ 阶段二（computeState）：
+    │   ├─ currentVersion = V3
+    │   ├─ getPeriod(version=V3) → null
+    │   ├─ periodBound = 0（冷启动）
+    │   ├─ 全量重算：processing_time <= T4
+    │   └─ Period: [version=V3, from=null, to=T4]
+    │
+    ├─ 阶段三（computeAssignments）：
+    │   ├─ currentVersion = V3
+    │   ├─ shouldReset = (V3 > periodBound=0) = true
+    │   ├─ lowerBoundClause = ""（全量重算）
+    │   └─ Period: [version=V3, from=null, to=T4]
+    │
+    └─ 阶段四（processAssignments）：
+        ├─ currentVersion = V3
+        ├─ getPeriod(version=V3) → null
+        ├─ periodBound = 0
+        ├─ 全量查询（lowerBoundClause 可能不启用）
+        ├─ JOIN pcp（旧值）
+        │   ├─ 值相同 → 跳过
+        │   └─ 值不同 → 触发
+        └─ Period: [version=V3, from=null, to=T4]
+
+时刻 T5：再次调度（now=T5）
+    │
+    ├─ currentVersion = V3
+    ├─ getPeriod(version=V3) → maxTo=T4
+    ├─ periodBound = T4
+    ├─ 恢复增量计算
+    │   ├─ 阶段二：processing_time >= T4
+    │   ├─ 阶段三：computed_at >= T4
+    │   └─ 阶段四：assigned_at >= T4（有限制条件）
+    │
+    └─ 收敛完成，恢复正常增量处理
+```
+
+---
+
+### 6.3 收敛条件汇总
+
+| 机制 | 作用 | 实现 |
+|-----|------|------|
+| **Period monotonic** | `from` 永远是上一轮的 `to`，不会回退 | `periods.ts:219-229` |
+| **Version 绑定** | Period 的 version 与 definitionUpdatedAt 绑定 | `periods.ts:214, 233` |
+| **shouldReset** | 定义更新时触发全量重算 | `computePropertiesIncremental.ts:129-148` |
+| **lowerBoundClause** | 只增量处理新数据 | 各阶段的条件拼接 |
+| **pcp 值快照** | 记录已处理的值，只触发变化 | `processAssignments` 的 JOIN 逻辑 |
+| **ReplacingMergeTree** | 重复写入取最新版本 | ClickHouse 表引擎 |
+| **argMaxState/uniqState** | 幂等聚合，重复计算结果一致 | AggregatingMergeTree |
+
+---
+
+### 6.4 收敛时间线示例
+
+```
+时刻 T0:
+  ├─ Postgres: definitionUpdatedAt=0 (V0)
+  └─ Period: 空
+
+时刻 T1: 第 1 轮调度（now=T1）
+  ├─ 阶段一：事件 E1(processing_time=T1) 写入
+  ├─ 阶段二：全量重算 → Period[V0, to=T1]
+  ├─ 阶段三：全量重算 → Period[V0, to=T1]
+  └─ 阶段四：全量处理 → Period[V0, to=T1], pcp[user_A, value=V]
+
+时刻 T2: 第 2 轮调度（now=T2）
+  ├─ 阶段一：事件 E2(processing_time=T2) 写入
+  ├─ 阶段二：periodBound=T1 → 增量 [T1, T2]
+  ├─ 阶段三：periodBound=T1 → 增量 [T1, T2]
+  └─ 阶段四：periodBound=T1 → 增量 + 值变化检测
+
+时刻 T3: 定义更新
+  └─ Postgres: definitionUpdatedAt=T3 (V3)
+
+时刻 T4: 第 3 轮调度（now=T4）
+  ├─ currentVersion = V3
+  ├─ 阶段二：getPeriod(V3)=null → periodBound=0 → 全量
+  ├─ 阶段三：shouldReset=true → 全量
+  ├─ 阶段四：getPeriod(V3)=null → periodBound=0 → 全量查询
+  │              ├─ 值相同 → 跳过
+  │              └─ 值不同 → 触发
+  └─ Period[V3, to=T4] 写入
+
+时刻 T5: 第 4 轮调度（now=T5）
+  ├─ currentVersion = V3
+  ├─ periodBound = T4
+  ├─ 恢复增量计算
+  │   ├─ 阶段二：processing_time >= T4
+  │   ├─ 阶段三：computed_at >= T4
+  │   └─ 阶段四：assigned_at >= T4（有限制条件）
+  └─ Period[V3, from=T4, to=T5] 写入
 ```
 
 ## 七、Schema 演进时的双库兼容做法
@@ -1133,8 +1409,10 @@ export async function deleteUserProperty({
 | computeState | `packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts` | 3006-3180 |
 | computeAssignments | `packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts` | 3255-3878 |
 | processAssignments | `packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts` | 4049-4292 |
-| AssignmentProcessor | `packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts` | 3928-4047 |
+| processRowsInner（执行顺序） | `packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts` | 3602-3750 |
 | buildProcessAssignmentsQuery | `packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts` | 3786-3912 |
-| Period 管理 | `packages/backend-lib/src/computedProperties/periods.ts` | 138-284 |
+| getLowerBoundClause | `packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts` | 494-498 |
 | shouldReset 判断 | `packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts` | 129-148 |
+| Period 查询 | `packages/backend-lib/src/computedProperties/periods.ts` | 138-193 |
+| Period 创建 | `packages/backend-lib/src/computedProperties/periods.ts` | 195-284 |
 | 属性赋值查询 | `packages/backend-lib/src/userProperties.ts` | 399-450 |
