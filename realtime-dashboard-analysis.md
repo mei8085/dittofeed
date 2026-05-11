@@ -673,6 +673,267 @@ type TimeOption =
 
 ---
 
+#### Custom 交互操作链路的结构化分析
+
+按照「操作前状态 → 关键代码 → 状态写回 → 是否触发查询 → 对兜底策略影响」的格式，逐项分析三类操作。
+
+---
+
+##### 操作一：已在 custom 状态再次点击 custom 选项
+
+**用户行为**：
+- 当前已选择 custom 范围（如 5.1-5.10）
+- 点击 DateRangeSelector 下拉菜单
+- 再次选择「Custom Date Range」选项
+
+**操作前状态**：
+```
+selectedTimeOption = "custom"
+dateRange = { startDate: "2026-05-01", endDate: "2026-05-10" }
+customDateRange = null  // 弹窗初始为关闭状态
+```
+
+**关键代码**（`dateRangeSelector.tsx:142-149`）：
+
+```typescript
+const customOnClickHandler = useCallback(() => {
+  if (value.selectedTimeOption === "custom") {
+    setCustomDateRange({
+      start: toCalendarDate(referenceDate),  // referenceDate 通常是当前时间
+      end: toCalendarDate(referenceDate),
+    });
+  }
+}, [value.selectedTimeOption, referenceDate]);
+```
+
+**状态写回**：
+| 状态变量 | 写回前 | 写回后 | 是否变化 |
+|---------|--------|--------|---------|
+| `customDateRange`（弹窗状态） | `null` | `{ start: referenceDate, end: referenceDate }` | ✅ 变化 |
+| `value.selectedTimeOption`（父组件状态） | `"custom"` | `"custom"` | ❌ 不变 |
+| `value.startDate`（父组件状态） | `"2026-05-01"` | `"2026-05-01"` | ❌ 不变 |
+| `value.endDate`（父组件状态） | `"2026-05-10"` | `"2026-05-10"` | ❌ 不变 |
+
+**是否触发查询**：❌ **否**
+
+原因分析：
+1. `customOnClickHandler` 只调用了 `setCustomDateRange`（弹窗内部状态）
+2. **没有调用** `onChange`（父组件回调）
+3. 父组件的 `dateRange` 状态没有变化
+4. React Query 的 `queryKey` = `["analysisChart", { startDate, endDate, ... }]` 没有变化
+5. 因此不会触发新查询
+
+**对兜底策略的影响**：
+- 之前认为「重新选择 custom」是可靠的兜底策略 → **实际是无效操作**
+- 用户可能以为「再次点击 custom 选项」会刷新 → 实际上什么都没发生（除了弹窗打开）
+- 兜底策略中「重新选择时间范围」需要更精确地定义：
+  - ✅ 重新选择预设范围（有效）
+  - ❌ 再次点击 custom 选项（无效）
+
+---
+
+##### 操作二：不改日期直接点击 Apply
+
+**用户行为**：
+- 当前已选择 custom 范围（如 5.1-5.10）
+- 通过操作一打开弹窗
+- **不修改日期**，直接点击「Apply」按钮
+
+**操作前状态**：
+```
+// 父组件状态
+selectedTimeOption = "custom"
+dateRange = { startDate: "2026-05-01", endDate: "2026-05-10" }
+
+// 弹窗内部状态（通过操作一设置）
+customDateRange = { 
+  start: toCalendarDate(referenceDate),  // 如 2026-05-11（今天）
+  end: toCalendarDate(referenceDate)
+}
+```
+
+**关键代码**（`dateRangeSelector.tsx:179-196`）：
+
+```typescript
+const handleCustomDateApply = useCallback(() => {
+  if (customDateRange) {
+    const startDate = customDateRange.start.toDate(...);
+    const endDate = customDateRange.end.toDate(...);
+
+    onChange({
+      startDate,
+      endDate,
+      selectedTimeOption: "custom",
+    });
+
+    setCustomDateRange(null);
+  }
+}, [customDateRange, onChange]);
+```
+
+**状态写回**：
+| 状态变量 | 写回前 | 写回后 | 是否变化 |
+|---------|--------|--------|---------|
+| `customDateRange`（弹窗状态） | `{ start: referenceDate, end: referenceDate }` | `null` | ✅ 变化（关闭） |
+| `value.selectedTimeOption`（父组件） | `"custom"` | `"custom"` | ❌ 不变 |
+| `value.startDate`（父组件） | `"2026-05-01"` | `referenceDate`（如 `"2026-05-11"`） | ✅ **变化** |
+| `value.endDate`（父组件） | `"2026-05-10"` | `referenceDate`（如 `"2026-05-11"`） | ✅ **变化** |
+
+**是否触发查询**：✅ **是，一定触发**
+
+原因分析：
+1. `handleCustomDateApply` **无条件调用** `onChange`
+2. 即使日期值相同（如用户手动改为与原来相同），React 的 `useState` 更新机制仍会触发重新渲染
+3. 在分析面板中，`onChange` 对应 `analysisChart.tsx` 中的状态更新：
+   ```typescript
+   // 第 222-241 行
+   <DateRangeSelector
+     value={{
+       startDate: new Date(state.dateRange.startDate),
+       endDate: new Date(state.dateRange.endDate),
+       selectedTimeOption: state.selectedTimeOption,
+     }}
+     onChange={(value) => {
+       setState((draft) => {
+         draft.selectedTimeOption = value.selectedTimeOption;
+         draft.dateRange = {
+           startDate: value.startDate.toISOString(),
+           endDate: value.endDate.toISOString(),
+         };
+         draft.referenceDate = value.endDate;
+       });
+     }}
+   />
+   ```
+4. `setState` 更新 → `chartQuery` 的 `queryKey` 变化 → React Query 发起新查询
+
+**关键细节**：日期范围是否变化？
+
+在当前实现中，**操作一 + 操作二** 的组合会导致日期范围**被重置**：
+- 操作一：弹窗默认值 = `referenceDate`（同一天，如 5.11-5.11）
+- 操作二：直接 Apply → 日期范围变为 5.11-5.11
+- 而非保持原来的 5.1-5.10
+
+**对兜底策略的影响**：
+- 触发了查询，但**有副作用**：日期范围被重置到 `referenceDate` 附近
+- 用户可能想「用相同区间刷新」→ 实际上区间缩小到同一天
+- 这可能导致：
+  - 图表数据量大幅减少（从 10 天变为 1 天）
+  - 用户困惑：「为什么数据变少了？」
+- 兜底策略可靠性：⚠️ 可触发查询，但结果可能不符合预期
+
+---
+
+##### 操作三：改为新的 custom 区间后 Apply
+
+**用户行为**：
+- 当前已选择 custom 范围（如 5.1-5.10）
+- 打开弹窗
+- 修改日期为新的区间（如 5.5-5.15）
+- 点击「Apply」按钮
+
+**操作前状态**：
+```
+// 父组件状态
+selectedTimeOption = "custom"
+dateRange = { startDate: "2026-05-01", endDate: "2026-05-10" }
+
+// 弹窗内部状态（用户修改后）
+customDateRange = { 
+  start: toCalendarDate(new Date("2026-05-05")),
+  end: toCalendarDate(new Date("2026-05-15"))
+}
+```
+
+**关键代码**（同操作二，`dateRangeSelector.tsx:179-196`）：
+
+```typescript
+const handleCustomDateApply = useCallback(() => {
+  if (customDateRange) {
+    const startDate = customDateRange.start.toDate(...);
+    const endDate = customDateRange.end.toDate(...);
+
+    onChange({
+      startDate,
+      endDate,
+      selectedTimeOption: "custom",
+    });
+
+    setCustomDateRange(null);
+  }
+}, [customDateRange, onChange]);
+```
+
+**状态写回**：
+| 状态变量 | 写回前 | 写回后 | 是否变化 |
+|---------|--------|--------|---------|
+| `customDateRange`（弹窗状态） | `{ start: 5.5, end: 5.15 }` | `null` | ✅ 变化（关闭） |
+| `value.selectedTimeOption`（父组件） | `"custom"` | `"custom"` | ❌ 不变 |
+| `value.startDate`（父组件） | `"2026-05-01"` | `"2026-05-05"` | ✅ **变化** |
+| `value.endDate`（父组件） | `"2026-05-10"` | `"2026-05-15"` | ✅ **变化** |
+
+**是否触发查询**：✅ **是，一定触发**
+
+触发条件：
+1. 用户修改了日期 → `customDateRange` 变化
+2. 点击 Apply → `onChange` 被调用
+3. 父组件 `dateRange` 状态更新
+4. `queryKey` = `["analysisChart", { startDate: "5.5", endDate: "5.15", ... }]` 变化
+5. React Query 发起新查询
+
+**触发条件的边界情况**：
+| 用户操作 | 是否触发查询 | 原因 |
+|---------|-----------|------|
+| 修改日期后 Apply | ✅ 是 | `dateRange` 变化 → `queryKey` 变化 |
+| 改为与原来相同的日期后 Apply | ⚠️ 取决于实现 | 如果是手动选择相同日期，`toISOString()` 可能产生不同的字符串（时间精度）|
+| 取消（点击 Cancel） | ❌ 否 | 不调用 `onChange` |
+
+**对兜底策略的影响**：
+- ✅ 可靠的兜底策略：「修改 custom 区间后 Apply」一定触发查询
+- 但需要用户**主动修改日期**，操作成本较高
+- 如果用户只想刷新不想改区间，这不是理想的兜底方式
+
+---
+
+##### 三类操作对比总结
+
+| 操作 | 操作前状态 | 关键代码 | 状态写回 | 是否触发查询 | 对兜底策略影响 |
+|-----|----------|---------|---------|-----------|--------------|
+| **操作一：再次点 custom** | `selectedTimeOption = "custom"`, `dateRange = {5.1, 5.10}` | `customOnClickHandler` 只调用 `setCustomDateRange` | `customDateRange` = `{referenceDate, referenceDate}`，父组件状态不变 | ❌ 否 | ❌ **无效操作**，仅打开弹窗 |
+| **操作二：弹窗直接 Apply** | `customDateRange` = `{referenceDate, referenceDate}`（由操作一设置） | `handleCustomDateApply` 调用 `onChange` | `dateRange` = `{referenceDate, referenceDate}`（区间被重置） | ✅ 是 | ⚠️ **有副作用**，区间被重置到 referenceDate |
+| **操作三：改区间后 Apply** | `customDateRange` = `{newStart, newEnd}` | `handleCustomDateApply` 调用 `onChange` | `dateRange` = `{newStart, newEnd}` | ✅ 是 | ✅ **可靠**，但需要修改区间 |
+
+---
+
+##### 修正后的兜底策略可靠性评估
+
+| 策略 | 操作方式 | 是否一定触发查询 | 是否有副作用 | 可靠性评级 |
+|-----|---------|---------------|-------------|-----------|
+| **重新选择预设时间范围** | 点击「最近 7 天」等预设选项 | ✅ 是 | ❌ 否 | ⭐⭐⭐ 高 |
+| **修改过滤条件** | 添加/移除 journeyId、channel 等 | ✅ 是 | ❌ 否 | ⭐⭐⭐ 高 |
+| **修改分组维度** | 切换 groupBy | ✅ 是 | ❌ 否 | ⭐⭐⭐ 高 |
+| **改为新 custom 区间后 Apply** | 选择新日期范围后点击 Apply | ✅ 是 | ❌ 否（区间变化是预期行为） | ⭐⭐⭐ 高 |
+| **窗口焦点恢复** | 切出再切回标签 | ✅ 是（staleTime = 0） | ❌ 否 | ⭐⭐ 中（被动触发） |
+| **页面导航** | 离开再返回分析页面 | ✅ 是（refetchOnMount） | ❌ 否 | ⭐⭐ 中（操作成本高） |
+| **网络重连** | 离线恢复在线 | ✅ 是 | ❌ 否 | ⭐ 低（不可控） |
+| **已在 custom 状态再次点 custom** | 再次选择 custom 选项 | ❌ 否 | ❌ 否（但也没帮助） | ⭐ 低（无效操作） |
+| **弹窗直接 Apply（不改日期）** | 操作一 + 直接 Apply | ✅ 是 | ✅ **有副作用**（区间被重置） | ⭐ 低（结果可能不符合预期） |
+| **手动刷新按钮** | 点击刷新按钮 | - | - | ❌ custom 范围时禁用 |
+
+**关键发现**：
+1. **「重新选择时间范围」作为兜底策略不够精确**：
+   - 预设范围：✅ 有效
+   - custom 选项：需要区分「再次点 custom」（无效）和「改区间后 Apply」（有效）
+2. **弹窗直接 Apply 有隐藏陷阱**：
+   - 如果通过「操作一」打开弹窗，默认值是 referenceDate
+   - 直接 Apply 会把区间重置到同一天
+3. **最可靠的主动兜底策略**：
+   - 方式 A：选择预设范围（如「最近 7 天」）
+   - 方式 B：修改 custom 区间后 Apply
+   - 方式 C：修改过滤条件/分组维度
+
+---
+
 #### 设计评估
 
 **优点**：
@@ -681,14 +942,24 @@ type TimeOption =
 3. **引导用户**：通过 DateRangeSelector 明确时间范围的控制权
 
 **潜在问题**：
-1. **发现性差**：用户可能不知道为什么按钮被禁用
-2. **操作成本**：重新选择时间范围需要额外点击
-3. **无提示**：没有 Tooltip 说明禁用原因和替代方式
+1. **操作一是无效操作**：用户可能以为「再次点击 custom」会刷新，实际上什么都没发生
+2. **操作二有副作用**：弹窗默认值 = referenceDate，直接 Apply 会重置区间
+3. **发现性差**：用户可能不知道为什么按钮被禁用
+4. **操作成本**：可靠的兜底策略需要额外操作（改区间、改过滤条件）
+5. **无提示**：没有 Tooltip 说明禁用原因和正确的替代方式
 
 **改进建议**：
-- 保持禁用逻辑，但添加禁用原因的 Tooltip
-- 考虑为 custom 范围添加「刷新但保持范围」的选项（语义：用相同范围重新查询）
-- 或者：custom 范围下刷新按钮改为「重新查询此范围」
+- **方案 A：修复 DateRangeSelector 行为**
+  - 当已在 custom 状态点击 custom 时，弹窗默认值应使用**当前已选区间**（`value.startDate/endDate`），而非重置为 referenceDate
+  - 这样操作二（直接 Apply）就能实现「用相同区间刷新」
+- **方案 B：添加禁用原因的 Tooltip 提示**
+  - 例如：「Custom 范围请选择新的日期区间后点击 Apply 刷新」
+- **方案 C：为 custom 范围添加「重新查询此范围」的替代按钮**
+  - 语义明确：保持区间不变，仅重新查询
+  - 绕过 DateRangeSelector 的复杂行为
+- **方案 D：简化逻辑，custom 范围下允许手动刷新按钮**
+  - 「刷新」=「用当前 custom 参数重新查询」
+  - 放弃「语义歧义」的顾虑，优先考虑用户体验
 
 ---
 
@@ -919,10 +1190,21 @@ Delivery
      - 为长时间范围（如「最近 30 天」）设置适度的 `staleTime`（如 30 秒）
      - 考虑自定义 `gcTime`（如延长到 10 分钟）以提供更好的导航过渡体验
 
-3. **Custom 时间范围的体验问题**：手动刷新按钮禁用是合理的语义设计，但用户体验可以优化：
-   - 添加禁用原因的 Tooltip 提示（「Custom 范围请使用 DateRangeSelector 刷新」）
-   - 考虑为 custom 范围添加「重新查询此范围」的替代按钮
-   - 或者：简化逻辑，custom 范围的「刷新」=「用相同参数重新查询」
+3. **Custom 时间范围的体验问题**：手动刷新按钮禁用是合理的语义设计，但 DateRangeSelector 的行为存在细微问题：
+   - **操作一（再次点 custom）是无效操作**：`customOnClickHandler` 只重置弹窗默认值，不调用 `onChange`，用户可能误以为已刷新
+   - **操作二（弹窗直接 Apply）有副作用**：如果用户不改日期直接 Apply，区间会被重置到 `referenceDate`（同一天），而非保留原区间
+   - **可考虑的改进**：
+     - **方案 A：修复 DateRangeSelector 行为**
+       - 当已在 custom 状态点击 custom 时，弹窗默认值应使用**当前已选区间**，而非重置为 referenceDate
+       - 这样操作二（直接 Apply）就能实现「用相同区间刷新」
+     - **方案 B：添加禁用原因的 Tooltip 提示**
+       - 例如：「Custom 范围请选择新的日期区间后点击 Apply 刷新」
+     - **方案 C：为 custom 范围添加「重新查询此范围」的替代按钮**
+       - 语义明确：保持区间不变，仅重新查询
+       - 绕过 DateRangeSelector 的复杂行为
+     - **方案 D：简化逻辑，custom 范围下允许手动刷新按钮**
+       - 「刷新」=「用当前 custom 参数重新查询」
+       - 放弃「语义歧义」的顾虑，优先考虑用户体验
 
 4. **查询性能**：对于大数据量，CTE 方式可能需要优化（如使用物化视图、预聚合表）
 
