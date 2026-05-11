@@ -77,7 +77,7 @@ argMax(segment_value, assigned_at) as latest_segment_value
 
 #### 3.1.4 多 Worker 并发写入的可见性窗口
 
-当多个 Worker 并发处理同一用户时，系统通过以下机制确保数据一致性：
+当多个 Worker 并发处理不同任务项时（或同一任务项因异常重试而重复处理时），系统通过以下机制确保数据一致性：
 
 **1. 写入等待机制 (`wait_end_of_query`)**
 
@@ -572,8 +572,19 @@ DittoFeed 的 A/B 实验系统通过以下机制保证多 Worker 环境下的一
 **同毫秒写入的风险与规避：**
 - **时间戳精度限制**：`Date.now()` 和 `DateTime64(3)` 都是毫秒级精度，存在同毫秒冲突的理论可能
 - **非确定性风险**：`argMax` 和 ReplacingMergeTree 在时间戳相同时行为取决于存储顺序
-- **主要规避策略**：工作流 `membership` 集合机制防止同一工作区被多个 Worker 同时处理
+- **主要规避策略**：工作流 `membership` 集合机制防止**同一任务项**被多个 Worker 同时处理（不是工作区级，是任务项级）
 - **次要规避策略**：确定性分桶算法确保即使重复计算，结果值也相同
+
+**队列去重键粒度（重要修正）：**
+- **工作区级去重**：`Workspace`、`Batch` 类型，去重键格式 `type:workspaceId`
+- **任务项级去重**：`Segment`、`UserProperty`、`Integration`、`Journey` 类型，去重键格式 `type:workspaceId:id`
+- **Split 模式并发**：当 `computePropertiesSplit = true` 时，工作区任务拆分为各属性独立任务，允许同一工作区的不同任务并行处理
+
+**Split 模式对 A/B 一致性的影响：**
+- **允许并行**：同一工作区的 Segment 和 UserProperty 任务可以并行处理
+- **增量机制保证最终一致性**：Segment 计算只处理 `updated_computed_property_state` 表中标记为"已更新"的用户
+- **可能的延迟**：如果 Segment 任务先于 UserProperty 任务执行，可能需要等待下一个计算周期才能处理新更新的用户
+- **不会丢失更新**：用户属性更新通过物化视图记录，最终会被处理
 
 **流量调整的生效条件：**
 - **必须更新 `definitionUpdatedAt`** 才能触发重算
