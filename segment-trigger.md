@@ -336,7 +336,94 @@ case JourneyNodeType.SegmentEntryNode: {
 }
 ```
 
-### 3.5 订阅关系建立
+### 3.5 "出分段"行为分析
+
+#### 3.5.1 Journey 路径中的过滤位置
+
+在 `processRowsInner` 函数中，`latest_segment_value = false`（出分段）被显式过滤，不会触发 Journey 启动：
+
+```typescript
+// packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:3637-3648
+for (const assignment of assignments) {
+  let assignmentCategory: ComputedAssignment[];
+  if (assignment.processed_for_type === "integration") {
+    assignmentCategory = integrationAssignments;
+  } else {
+    if (!assignment.latest_segment_value) {
+      continue;  // ← 出分段用户被直接跳过
+    }
+    assignmentCategory = journeySegmentAssignments;
+  }
+  assignmentCategory.push(assignment);
+}
+```
+
+**过滤位置分析**：
+- **第一层过滤（SQL 查询层）**：在 `buildProcessAssignmentsQuery` 中，`typeCondition = "cpa.latest_segment_value = true"`（第 3816 行），但被 `OR (pcp.user_id != '')` 条件部分绕过，允许"之前在段中但现在出分段"的用户进入结果集
+- **第二层过滤（代码层）**：在 `processRowsInner` 中，`if (!assignment.latest_segment_value) continue` 无条件跳过所有出分段用户
+
+**为何不会触发启动**：
+1. **语义设计**：SegmentEntryNode 仅在用户"进入"分段时触发 Journey，出分段是"退出"事件，不应启动新的 Journey
+2. **单向触发模型**：Dittofeed 的 Journey 设计为单向流程，一旦启动后在 Workflow 内部管理生命周期（通过 Signal 通知状态变化），出分段不会终止已启动的 Journey
+3. **去重逻辑**：`processed_computed_properties_v2` 表记录了已处理的赋值，结合 `argMax(segment_value, processed_at)` 避免重复处理
+
+#### 3.5.2 Integration 路径的处理差异
+
+Integration 路径**不会过滤** `latest_segment_value = false`，而是将完整的状态变化传递给下游集成：
+
+```typescript
+// packages/backend-lib/src/computedProperties/computePropertiesIncremental.ts:3683-3709
+...integrationAssignments.flatMap(async (assignment) => {
+  switch (assignment.processed_for) {
+    case HUBSPOT_INTEGRATION: {
+      const update: ComputedPropertyUpdate =
+        assignment.type === "segment"
+          ? {
+              type: "segment",
+              segmentId: assignment.computed_property_id,
+              segmentVersion: updateVersion,
+              currentlyInSegment: assignment.latest_segment_value,  // ← 传递完整状态
+            }
+          : { ... };
+
+      return startHubspotUserIntegrationWorkflow({
+        workspaceId: assignment.workspace_id,
+        userId: assignment.user_id,
+        workflowClient,
+        update,
+      });
+    }
+  }
+});
+```
+
+**HubSpot 实际处理逻辑**（packages/backend-lib/src/integrations/hubspot/activities.ts:1037-1048）：
+
+```typescript
+if (update.currentlyInSegment) {
+  return api.addContactToList({
+    token: hubspotAccessToken.accessToken,
+    listId,
+    email,
+  });
+}
+return api.removeContactFromList({  // ← 出分段时从列表移除
+  token: hubspotAccessToken.accessToken,
+  listId,
+  email,
+});
+```
+
+**两条路径的对比**：
+
+| 维度 | Journey 路径 | Integration 路径 |
+|-----|-------------|-----------------|
+| `latest_segment_value = false` 处理 | 被过滤（continue） | 完整传递给下游 |
+| 触发动作 | 仅启动新 Journey | 双向同步（add/remove） |
+| 语义 | 单向"进入"触发 | 双向状态同步 |
+| 生命周期管理 | Workflow 内部通过 Signal 管理 | 每次变化都触发独立动作 |
+
+### 3.6 订阅关系建立
 
 在 `processAssignments` 中建立 segment -> journey 的映射：
 
@@ -360,7 +447,7 @@ const subscribedJourneyMap = journeys.reduce<Map<string, Set<string>>>(
 
 ---
 
-## 四、全量重算与实时更新的取舍
+## 四、Period 窗口机制与全量重算条件
 
 ### 4.1 增量计算的核心：Period 机制
 
