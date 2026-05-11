@@ -947,7 +947,222 @@ const messagePromises: Promise<MessageSendResultWithResponseItem>[] =
 
 ---
 
-### 8.4 批量发送协调
+### 8.4 MobilePush 广播不可用的完整拒绝链路
+
+#### 8.4.1 三层拦截点概览
+
+MobilePush 在 Broadcast V2 中被三层防线挡住，形成了完整的拒绝链路：
+
+| 层级 | 拦截位置 | 拦截方式 | 错误信息 |
+|------|---------|---------|---------|
+| L1 | 前端 Dashboard | Channel 选择器禁用 | 不允许选择 MobilePush |
+| L2 | 类型 Schema（isomorphic-lib） | Union 不含 MobilePush 变体 | 类型校验不通过 |
+| L3 | 后端 Business Logic（upsertBroadcastV2） | 显式 ConstraintViolation 检查 | "Mobile push is not supported yet" |
+
+#### 8.4.2 请求时序：消息如何被挡住
+
+```
+用户在 Dashboard 创建 Broadcast
+        ↓
+[L1 前端拦截]
+│
+├─ 创建页面初始化
+│    ├─ useCreateBroadcastMutation 生成请求
+│    ├─ Channel 选择器渲染
+│    │     └─ <MenuItem disabled value={ChannelType.MobilePush}>
+│    │              {CHANNEL_NAMES[ChannelType.MobilePush]}
+│    │        </MenuItem>
+│    └─ 用户无法选择 MobilePush
+│              ↓
+│         正常流程：选择 Email/SMS/Webhook
+│         ↓
+│         到达 L3 后端
+│
+└─ 若有人绕过前端（如直接调 API）
+              ↓
+        [L2 Schema 拦截]
+        └─ UpsertBroadcastV2Request.config.message 的类型定义：
+           Type.Union([
+             BroadcastEmailMessageVariant,
+             BroadcastSmsMessageVariant,
+             Type.Omit(WebhookMessageVariant, ["templateId"]),
+             // 没有 MobilePush
+           ])
+              ↓
+        [L3 后端拦截]
+        └─ packages/backend-lib/src/broadcasts.ts:595-600
+              ┌──────────────────────────────────────────┐
+              │ if (channel === ChannelType.MobilePush) { │
+              │   return err({                           │
+              │     type: ConstraintViolation,            │
+              │     message:                              │
+              │       "Mobile push is not supported yet", │
+              │   });                                     │
+              │ }                                         │
+              └──────────────────────────────────────────┘
+```
+
+#### 8.4.3 第一层：前端拦截（Dashboard）
+
+**代码位置**：
+- 选择器禁用：`packages/dashboard/src/pages/broadcasts/template/[id].page.tsx:391-393`
+- 强行切换抛异常：`packages/dashboard/src/pages/broadcasts/template/[id].page.tsx:347-349`
+
+```typescript
+// Channel 选择器
+<MenuItem disabled value={ChannelType.MobilePush}>
+  {CHANNEL_NAMES[ChannelType.MobilePush]}
+</MenuItem>
+
+// 切换逻辑
+case ChannelType.MobilePush:
+  throw new Error("MobilePush not implemented");
+```
+
+**拦截效果**：
+- 在正常 UI 流程中，用户根本无法选择 MobilePush
+- 即便通过 DOM 操作强行修改状态，会立即抛异常
+
+#### 8.4.4 第二层：Schema 拦截（TypeBox）
+
+**代码位置**：`packages/isomorphic-lib/src/types.ts:5994-6007`
+
+```typescript
+export const BroadcastV2Config = Type.Object({
+  type: Type.Literal(BroadcastConfigTypeEnum.V2),
+  rateLimit: Type.Optional(Type.Number()),
+  message: Type.Union([
+    BroadcastEmailMessageVariant,
+    BroadcastSmsMessageVariant,
+    Type.Omit(WebhookMessageVariant, ["templateId"]),
+    // ❌ 没有 BroadcastMobilePushMessageVariant
+  ]),
+});
+```
+
+**拦截效果**：
+- Fastify + TypeBox 在请求体校验阶段就会拒绝 `{ type: "MobilePush" }`
+- 甚至还没进入后端业务逻辑
+
+**注意**：实际上 `BroadcastMobilePushMessageVariant` 这个类型**根本不存在**——类型层面就没有定义 MobilePush 的广播消息变体。
+
+#### 8.4.5 第三层：后端拦截（upsertBroadcastV2）
+
+**代码位置**：`packages/backend-lib/src/broadcasts.ts:510-600`
+
+```typescript
+// Step 1: 收集三个来源的 channel
+const channels = new Set<ChannelType>();
+if (messageTemplateDefinition) {
+  channels.add(messageTemplateDefinition.type);  // 消息模板的 channel
+}
+if (subscriptionGroup) {
+  channels.add(subscriptionGroup.channel);       // 订阅组的 channel
+}
+if (config) {
+  channels.add(config.message.type);             // 广播 config 的 channel
+}
+
+// Step 2: 校验三个来源必须一致
+if (channels.size > 1) {
+  return err({
+    type: UpsertBroadcastV2ErrorTypeEnum.ConstraintViolation,
+    message: "The message template, subscription group, and broadcast config must all be the same channel type",
+  });
+}
+
+// Step 3: 新增路径 → 检查是否为 MobilePush
+if (!existing) {
+  const channel: ChannelType = Array.from(channels)[0] ?? ChannelType.Email;
+
+  if (channel === ChannelType.MobilePush) {
+    return err({
+      type: UpsertBroadcastV2ErrorTypeEnum.ConstraintViolation,
+      message: "Mobile push is not supported yet",
+    });
+  }
+}
+```
+
+**拦截逻辑详解**：
+
+1. **channel 收集**：从三个来源推导 channel
+   - `messageTemplate.definition.type`：消息模板定义的类型
+   - `subscriptionGroup.channel`：订阅组的 channel
+   - `config.message.type`：广播 config 中显式指定的类型
+
+2. **一致性校验**：三个来源必须指向同一个 channel
+
+3. **MobilePush 显式拒绝**：
+   - 只在**新增路径**（`!existing`）检查
+   - 更新已存在的 broadcast 不会触发此检查
+   - 返回 `ConstraintViolation` 类型错误
+
+#### 8.4.6 完整错误处理（API 层）
+
+**代码位置**：`packages/api/src/controllers/broadcastsController.ts:86-106`
+
+```typescript
+fastify.withTypeProvider<TypeBoxTypeProvider>().put(
+  "/v2",
+  {
+    schema: {
+      body: UpsertBroadcastV2Request,  // ← 这里进行 L2 拦截
+      response: {
+        200: BroadcastResourceV2,
+        404: BaseMessageResponse,
+      },
+    },
+  },
+  async (request, reply) => {
+    const result = await upsertBroadcastV2(request.body);
+    if (result.isErr()) {
+      // ← 这里返回 L3 拦截的错误
+      return reply.status(400).send(result.error);
+    }
+    return reply.status(200).send(result.value);
+  },
+);
+```
+
+#### 8.4.7 三层拦截的关系
+
+```
+正常 UI 流程：
+  ┌─────────────────────────────────────────┐
+  │ L1 前端：MenuItem disabled              │← 大多数情况下在这里被挡住
+  │  （用户无法选择 MobilePush）             │
+  └─────────────────────────────────────────┘
+
+绕过前端（API 直调）：
+  ┌─────────────────────────────────────────┐
+  │ L2 Schema：TypeBox Union 校验失败        │← 类型层面被挡住
+  │  Fastify 400 Bad Request               │
+  └─────────────────────────────────────────┘
+
+绕过类型（假设 hack 了类型系统）：
+  ┌─────────────────────────────────────────┐
+  │ L3 后端：upsertBroadcastV2 显式检查      │← 业务逻辑层面被挡住
+  │  400 ConstraintViolation               │
+  │  "Mobile push is not supported yet"    │
+  └─────────────────────────────────────────┘
+```
+
+#### 8.4.8 关键代码索引
+
+| 层级 | 文件 | 关键位置 | 功能 |
+|------|------|---------|------|
+| L1 前端 | `packages/dashboard/src/pages/broadcasts/template/[id].page.tsx` | 347-349, 391-393 | 选择器禁用 + 强行切换抛异常 |
+| L1 前端 | `packages/dashboard/src/lib/useCreateBroadcastMutation.ts` | 55 | PUT /broadcasts/v2 |
+| L2 Schema | `packages/isomorphic-lib/src/types.ts` | 5994-6007 | BroadcastV2Config.message Union |
+| L2 Schema | `packages/isomorphic-lib/src/types.ts` | 6121-6137 | UpsertBroadcastV2Request |
+| L3 后端 | `packages/backend-lib/src/broadcasts.ts` | 510-526 | channel 收集与一致性校验 |
+| L3 后端 | `packages/backend-lib/src/broadcasts.ts` | 592-600 | MobilePush 显式拒绝 |
+| API 路由 | `packages/api/src/controllers/broadcastsController.ts` | 86-106 | Fastify PUT /broadcasts/v2 |
+
+---
+
+### 8.5 批量发送协调
 
 批量发送通过 `batchMessageUsers` 函数处理（`packages/backend-lib/src/messaging.ts:2536+`）：
 
