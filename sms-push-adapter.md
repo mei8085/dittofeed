@@ -658,11 +658,257 @@ export async function sendSmsWithFailover(params): Promise<BackendMessageSendRes
 
 ---
 
-## 8. 跨 Channel 速率与限频协调
+## 8. 三层限频协调机制详解
 
-### 8.1 限频现状
+系统的限频协调策略分为三个层级，当前只有第一层（Broadcast V2）部分落地：
 
-#### 8.1.1 Provider 层面的限频识别
+| 层级 | 机制 | 状态 | 适用场景 |
+|------|------|------|---------|
+| L1 | Broadcast V2 rateLimit | ✅ 已落地 | 广播批量发送 |
+| L2 | Journey RateLimitNode | ❌ 类型定义存在，执行未实现 | 工作流内消息频率控制 |
+| L3 | 跨 channel 限频协调器 | ❌ 完全不存在 | SMS/Push/Email 全局协调 |
+
+### 8.1 第一层：Broadcast V2 rateLimit 节流（已落地）
+
+#### 8.1.1 核心实现
+
+**代码位置**：`packages/backend-lib/src/broadcasts/broadcastWorkflowV2.ts:101-275`
+
+Broadcast V2 的限频逻辑位于 `sendAllMessages` 函数的 do-while 循环中：
+
+```typescript
+const { rateLimit } = broadcast.config;
+
+// 配置校验
+if (rateLimit !== undefined && rateLimit <= 0) {
+  logger.error("rate limit is less than or equal to 0, invalid config", {
+    broadcastId,
+    rateLimit,
+    workspaceId,
+  });
+  await updateStatus("Cancelled");
+  return;
+}
+```
+
+**限频算法**（`broadcastWorkflowV2.ts:238-271`）：
+
+```typescript
+let sleepTime = 0;
+if (rateLimit && messagesSent > 0) {
+  // 目标周期时间（秒）= 发送消息数 / rateLimit（QPS）
+  const targetCycleTimeSeconds = messagesSent / rateLimit;
+  const targetCycleTimeMillis = targetCycleTimeSeconds * 1000;
+  
+  // 需要 sleep 的时间 = 目标周期时间 - 实际执行时间
+  const sleepNeededMillis =
+    targetCycleTimeMillis - activityDurationMillis;
+
+  if (sleepNeededMillis > 0) {
+    sleepTime = Math.max(10, sleepNeededMillis);  // 最少 sleep 10ms
+    logger.info("Applying rate limit sleep.", {
+      targetCycleMs: targetCycleTimeMillis,
+      activityDurationMs: activityDurationMillis,
+      sleepNeededMs: sleepNeededMillis,
+      sleepDurationMs: sleepTime,
+    });
+  } else {
+    logger.info("Rate limit - no sleep needed.", {
+      targetCycleMs: targetCycleTimeMillis,
+      activityDurationMs: activityDurationMillis,
+      sleepNeededMs: sleepNeededMillis,
+    });
+    sleepTime = 0;
+  }
+}
+
+if (sleepTime > 0) {
+  await sleep(sleepTime);  // Temporal workflow sleep
+}
+```
+
+#### 8.1.2 限频公式
+
+```
+sleepTime = max(10, (messagesSent / rateLimit) * 1000 - activityDurationMillis)
+```
+
+- **rateLimit**：每秒发送的消息数（QPS）
+- **messagesSent**：当前批次实际发送的消息数
+- **activityDurationMillis**：当前批次发送活动的实际执行时间
+
+#### 8.1.3 测试验证
+
+**代码位置**：`packages/backend-lib/src/broadcasts/broadcastWorkflowV2.test.ts:356-450`
+
+测试用例 `"when sending a broadcast immediately with a rate limit"` 验证了：
+
+```typescript
+// 配置：batchSize=1, rateLimit=1（每秒 1 条）
+await createBroadcast({
+  config: {
+    type: "V2",
+    message: { type: ChannelType.Email },
+    batchSize: 1,
+    rateLimit: 1,  // 每秒 1 条消息
+  },
+});
+
+// 断言 1：第 1 条消息立即发送
+expect(senderMock, "should have sent 1 message initially").toHaveBeenCalledTimes(1);
+
+// 断言 2：等待 1.5 秒后，第 2 条消息发送（因为 rateLimit=1）
+await testEnv.sleep(1500);
+expect(senderMock, "should have sent 2 messages after waiting for one rate limit period")
+  .toHaveBeenCalledTimes(2);
+```
+
+#### 8.1.4 特性总结
+
+| 特性 | 状态 | 说明 |
+|------|------|------|
+| 配置类型 | `Type.Optional(Type.Number())` | 可选，不配置则不限频 |
+| 配置校验 | ✅ | rateLimit ≤ 0 时取消广播 |
+| 限流算法 | 周期补眠 | sleep = 目标周期 - 已用时间 |
+| 最小 sleep | 10ms | 防止负 sleep |
+| 暂停/恢复 | ✅ | 支持 pause/resume signal |
+| 不可重试错误处理 | ✅ | 遇到 NonRetryableError 时暂停广播 |
+
+**局限性**：
+- 只在 Broadcast V2 工作流中实现，Journey 不适用
+- 不区分 channel，所有消息共用同一个 rateLimit
+- 不区分 provider，Twilio 和 SignalWire 共用同一个限频
+- 没有全局配额概念，多个广播之间独立限频
+
+---
+
+### 8.2 第二层：Journey RateLimitNode（类型定义存在，执行未实现）
+
+#### 8.2.1 类型定义
+
+**代码位置**：`packages/isomorphic-lib/src/types.ts:883, 1040-1050`
+
+```typescript
+export enum JourneyNodeType {
+  // ...
+  RateLimitNode = "RateLimitNode",
+  // ...
+}
+
+export const RateLimitNode = Type.Object(
+  {
+    ...BaseNode,  // { id: string }
+    type: Type.Literal(JourneyNodeType.RateLimitNode),
+  },
+  {
+    title: "Rate Limit Node",
+    description:
+      "Used to limit the frequency with which users are contacted by a given Journey.",
+  },
+);
+```
+
+**类型结构**：
+- 只有 `id` 和 `type` 两个字段
+- **没有** `rate`（速率）、`period`（周期）、`limit`（数量）等配置字段
+- 属于 `JourneyBodyNode` union 的成员之一
+
+#### 8.2.2 执行现状
+
+**代码位置**：`packages/backend-lib/src/journeys/userWorkflow.ts:1070-1077`
+
+```typescript
+case JourneyNodeType.RateLimitNode: {
+  logger.error("unable to handle un-implemented node type", {
+    ...defaultLoggingFields,
+    nodeType: currentNode.type,
+  });
+  nextNode = definition.exitNode;  // 直接跳转到退出节点
+  break;
+}
+```
+
+**执行行为**：
+1. 记录 `logger.error` 日志
+2. 将 `nextNode` 设置为 `definition.exitNode`
+3. 后续循环处理 exitNode，用户 Journey 结束
+
+**净效果**：RateLimitNode 不仅不执行限频逻辑，反而会导致用户直接退出 Journey。
+
+#### 8.2.3 问题分析
+
+| 问题 | 说明 |
+|------|------|
+| 类型定义不完整 | 缺少 `rate`、`period`、`limit` 等核心配置字段 |
+| 执行逻辑缺失 | 没有任何实际的限频/节流逻辑 |
+| 副作用有害 | 遇到此节点直接退出 Journey，破坏用户旅程 |
+
+---
+
+### 8.3 第三层：跨 Channel 限频协调器（完全不存在）
+
+#### 8.3.1 Broadcast V2 消息 Union 的边界
+
+**代码位置**：`packages/isomorphic-lib/src/types.ts:5994-6007`
+
+```typescript
+export const BroadcastV2Config = Type.Object({
+  type: Type.Literal(BroadcastConfigTypeEnum.V2),
+  rateLimit: Type.Optional(Type.Number()),  // 限频配置
+  defaultTimezone: Type.Optional(Type.String()),
+  useIndividualTimezone: Type.Optional(Type.Boolean()),
+  errorHandling: Type.Optional(BroadcastErrorHandling),
+  batchSize: Type.Optional(Type.Number()),
+  message: Type.Union([
+    BroadcastEmailMessageVariant,    // Email
+    BroadcastSmsMessageVariant,      // SMS
+    Type.Omit(WebhookMessageVariant, ["templateId"]),  // Webhook
+    // ❌ 缺少 MobilePush
+  ]),
+});
+```
+
+**Broadcast V2 支持的 Channel**：
+- ✅ Email
+- ✅ SMS
+- ✅ Webhook
+- ❌ MobilePush
+
+#### 8.3.2 前端 Dashboard 中的 MobilePush 状态
+
+**代码位置**：`packages/dashboard/src/pages/broadcasts/template/[id].page.tsx:347-349, 391-393`
+
+```typescript
+// 编辑器切换时
+case ChannelType.MobilePush:
+  throw new Error("MobilePush not implemented");
+
+// Channel 选择器中
+<MenuItem disabled value={ChannelType.MobilePush}>
+  {CHANNEL_NAMES[ChannelType.MobilePush]}
+</MenuItem>
+```
+
+**状态**：
+- Channel 选择器中显示但**禁用**
+- 强行切换会抛出异常
+- 系统层面不支持 MobilePush 广播
+
+#### 8.3.3 对"跨 Channel 限频"的边界影响
+
+| 维度 | 现状 | 边界影响 |
+|------|------|---------|
+| Broadcast 支持的 Channel | Email + SMS + Webhook | MobilePush 根本无法走广播流程，也就不存在"跨 channel 限频"的问题 |
+| rateLimit 的 scope | 单广播、单 channel | 一个广播只能选一个 channel，rateLimit 只对该 channel 生效 |
+| 全局限频 | 不存在 | 多个广播之间、SMS 和 Push 之间没有任何协调 |
+| Provider 级限频 | 不存在 | Twilio 和 SignalWire 共用同一个广播 rateLimit（如果同时配置了两个广播） |
+
+**结论**：当前架构下"跨 channel 限频"是一个伪命题，因为：
+1. **Broadcast V2**：不支持 MobilePush，且单广播只能选一个 channel
+2. **Journey**：RateLimitNode 完全未实现
+3. **系统层面**：没有全局限频协调器
+
+#### 8.3.4 Provider 层面的限频识别（补充）
 
 **SignalWire**（`packages/backend-lib/src/destinations/signalwire.ts:18-25`）：
 
@@ -685,15 +931,9 @@ const SIGNAL_WIRE_RETRYABLE_ERROR_CODES = new Set([
 - 完整实现尚未接入主流程
 - FCM 有 HTTP 429（Too Many Requests）响应，但当前代码未处理
 
-#### 8.1.2 系统层面的限频协调
+#### 8.3.5 批量发送中的并发
 
-**现状**：
-- 未发现专门的跨 channel 限频协调器
-- 未发现全局的消息发送速率限制器
-- 未发现按 provider 分配配额的机制
-- 主要依赖 Temporal 工作流引擎的活动调度能力
-
-**批量发送中的并发**（`packages/backend-lib/src/messaging.ts:2588-2590`）：
+**代码位置**：`packages/backend-lib/src/messaging.ts:2588-2590`
 
 ```typescript
 const messagePromises: Promise<MessageSendResultWithResponseItem>[] =
@@ -705,7 +945,9 @@ const messagePromises: Promise<MessageSendResultWithResponseItem>[] =
 
 批量发送使用 `Promise.all` 并行执行，没有内置的并发控制或速率限制。
 
-### 8.2 批量发送协调
+---
+
+### 8.4 批量发送协调
 
 批量发送通过 `batchMessageUsers` 函数处理（`packages/backend-lib/src/messaging.ts:2536+`）：
 
@@ -748,27 +990,6 @@ const trackEvents: KnownBatchTrackData[] = messageResults.flatMap(
 | RetryableError | ❌ 否 | 等待后续重试成功后再记录 |
 | throw 捕获（如 MobilePush） | ❌ 否 | `backendMessageSendResult = null`，不追踪 |
 
-### 8.3 限频改进建议
-
-**建议实现的协调机制**：
-
-1. **Provider 级限频**：
-   - 为每个 provider 配置 QPS 限制
-   - 使用令牌桶或漏桶算法
-   - 跨进程共享限频状态（如 Redis）
-
-2. **Channel 级优先级**：
-   - 定义 SMS vs Push 的发送优先级
-   - 高优先级消息优先占用配额
-
-3. **动态退避**：
-   - 根据 provider 返回的 `Retry-After` 头动态调整
-   - 连续失败时增加退避时间
-
-4. **并发控制**：
-   - 批量发送中添加 `p-limit` 或类似机制
-   - 限制并行发送数量
-
 ---
 
 ## 9. 关键代码位置索引
@@ -794,10 +1015,15 @@ const trackEvents: KnownBatchTrackData[] = messageResults.flatMap(
 | 批量发送 catch 块 | `packages/backend-lib/src/messaging.ts` | 2745-2770 |
 | Journey Activity 重试 | `packages/backend-lib/src/journeys/userWorkflow/activities.ts` | 258-300 |
 | Temporal retryPolicy | `packages/backend-lib/src/journeys/userWorkflow.ts` | 955-960 |
+| Broadcast V2 rateLimit 实现 | `packages/backend-lib/src/broadcasts/broadcastWorkflowV2.ts` | 101-275 |
+| Broadcast V2 rateLimit 测试 | `packages/backend-lib/src/broadcasts/broadcastWorkflowV2.test.ts` | 356-450 |
+| Journey RateLimitNode 类型 | `packages/isomorphic-lib/src/types.ts` | 1040-1050 |
+| Journey RateLimitNode 执行 | `packages/backend-lib/src/journeys/userWorkflow.ts` | 1070-1077 |
+| Broadcast V2 消息 Union | `packages/isomorphic-lib/src/types.ts` | 5994-6007 |
 
 ---
 
-## 10. 总结与展望
+## 10. 总结与最终结论
 
 ### 10.1 当前优势
 
@@ -806,35 +1032,64 @@ const trackEvents: KnownBatchTrackData[] = messageResults.flatMap(
 3. **明确的错误分类**：可重试/不可重试界限清晰，便于上层调度
 4. **Provider 配置灵活**：支持工作区默认、调用覆盖、父级继承三级配置
 5. **两层重试机制**：Provider 内可重试错误识别 + Temporal 工作流自动重试
+6. **Broadcast V2 限频**：已实现基于 sleep 的 QPS 控制，支持暂停/恢复
 
-### 10.2 待改进点
+### 10.2 已落地功能清单
 
-#### 10.2.1 MobilePush 相关
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| 统一发送入口 | ✅ | `sendMessage` 支持 Email/SMS/Webhook，Push 抛出 "not implemented" |
+| 统一响应结构 | ✅ | `BackendMessageSendResult = Result<MessageSuccess, MessageSendFailure>` |
+| 可重试错误识别 | ⚠️ | 仅 SignalWire 实现，Twilio 和 FCM 缺失 |
+| 工作流层重试 | ✅ | Temporal Activity retryPolicy + Activity 内熔断 |
+| Provider 间 Failover | ❌ | 仅支持手动 `providerOverride`，无自动切换 |
+| Broadcast V2 rateLimit | ✅ | sleep 时间 = (messagesSent / rateLimit) - activityDuration |
+| Journey RateLimitNode | ❌ | 类型存在但执行时直接 exitNode，有害 |
+| Broadcast V2 MobilePush | ❌ | 消息 Union 不包含，前端禁用 |
+| 跨 Channel 全局限频 | ❌ | 完全不存在 |
+| Provider 级并发控制 | ❌ | 批量发送使用 Promise.all，无并发限制 |
 
-1. **MobilePush 实现不完整**：FCM provider 存在但发送逻辑未接入主流程
-2. **"未实现"错误归类不当**：当前通过 throw 导致被误归类为 RetryableError，应返回 Result.err()
+### 10.3 待改进点
 
-#### 10.2.2 重试机制
+#### 10.3.1 MobilePush 相关
 
-1. **Twilio 可重试判断缺失**：仅 SignalWire 实现了细粒度的可重试错误码识别，Twilio 的 429/5xx 错误不会触发自动重试
-2. **缺少 Provider 间 Failover**：provider 失败时无法自动切换到备用 provider
+| 问题 | 优先级 | 说明 |
+|------|--------|------|
+| MobilePush 发送流程未接入 | P0 | `sendMessage` 中直接 throw，未调用 FCM provider |
+| "未实现"错误归类不当 | P0 | throw 导致被归类为 RetryableError，应返回 Result.err() |
+| Broadcast V2 不支持 MobilePush | P0 | 消息 Union 只包含 Email/SMS/Webhook |
+| Journey 编辑器不支持 MobilePush | P0 | 前端选择器禁用，强行切换抛异常 |
 
-#### 10.2.3 限频协调
+#### 10.3.2 重试与 Failover
 
-1. **缺少跨 channel 限频**：无全局速率控制，完全依赖 provider 自身限制
-2. **批量发送无并发控制**：Promise.all 并行执行，可能超过 provider QPS 限制
+| 问题 | 优先级 | 说明 |
+|------|--------|------|
+| Twilio 可重试判断缺失 | P1 | 429/5xx 错误被当作不可重试 |
+| Provider 间自动 Failover | P1 | 失败时无法自动切换到备用 provider |
 
-### 10.3 建议优先级
+#### 10.3.3 限频协调
 
-| 优先级 | 改进项 | 说明 |
-|--------|--------|------|
-| P0 | 完成 MobilePush 发送流程 | 打通 FCM 到统一发送入口，确保返回 Result 而非 throw |
-| P0 | 修正 MobilePush 错误归类 | 改为返回 `BadWorkspaceConfiguration` 类型的错误 |
-| P1 | 实现 Provider 故障转移 | 配置 provider 优先级列表，不可重试错误时自动切换 |
-| P1 | 完善 Twilio 可重试判断 | 参照 SignalWire 实现细粒度错误码分类（429、5xx 等） |
-| P2 | 实现跨 channel 限频协调器 | 引入 Redis 限频，支持优先级队列和并发控制 |
+| 问题 | 优先级 | 说明 |
+|------|--------|------|
+| Journey RateLimitNode 实现缺失 | P1 | 当前实现有害，直接退出 Journey |
+| RateLimitNode 类型不完整 | P1 | 缺少 rate/period/limit 等配置字段 |
+| 批量发送无并发控制 | P2 | Promise.all 可能超过 provider QPS |
+| 跨 channel 全局限频协调器 | P3 | 当前架构下优先级较低 |
 
-### 10.4 错误归类速查表
+### 10.4 建议优先级
+
+| 优先级 | 改进项 | 预估工作量 | 影响范围 |
+|--------|--------|-----------|---------|
+| P0 | 完成 MobilePush 发送流程 | 中 | 打通 FCM → sendMessage → Broadcast/Journey |
+| P0 | 修正 MobilePush 错误归类 | 小 | 改为返回 `BadWorkspaceConfiguration` |
+| P0 | Broadcast V2 支持 MobilePush | 中 | 消息 Union + 前端编辑器 + 发送逻辑 |
+| P1 | 完善 Twilio 可重试判断 | 小 | 参照 SignalWire，识别 429/5xx |
+| P1 | 实现 Journey RateLimitNode | 中 | 新增配置字段 + 执行逻辑（可能需要 Redis） |
+| P1 | 实现 Provider 自动 Failover | 中 | 优先级列表 + 不可重试错误时切换 |
+| P2 | 批量发送并发控制 | 小 | 引入 p-limit，配置最大并发数 |
+| P3 | 全局限频协调器 | 大 | Redis 令牌桶 + 优先级队列 + 动态退避 |
+
+### 10.5 错误归类速查表
 
 | 场景 | throw vs return err | 批量发送归类 | Journey 行为 |
 |------|---------------------|-------------|-------------|
@@ -845,3 +1100,32 @@ const trackEvents: KnownBatchTrackData[] = messageResults.flatMap(
 | 模板不存在 | `return err()` | NonRetryableError | 不重试，节点退出/跳过 |
 | 用户缺少手机号 | `return err()` | RetryableError | 不重试（isNonRetryable=false 但不 throw） |
 | MobilePush not implemented | `throw` | RetryableError | Temporal 重试 3 次后退出 |
+
+### 10.6 限频机制速查表
+
+| 机制 | 支持 Channel | 配置方式 | 算法 | 状态 |
+|------|-------------|---------|------|------|
+| Broadcast V2 rateLimit | Email + SMS + Webhook | `broadcast.config.rateLimit` (QPS) | sleep = 目标周期 - 已用时间 | ✅ 已落地 |
+| SignalWire 限频错误识别 | SMS | 硬编码错误码列表 (30022, 30027) | throw → Temporal 指数退避 | ✅ 已落地 |
+| Twilio 限频错误识别 | SMS | 未实现 | 无 | ❌ 缺失 |
+| Journey RateLimitNode | 所有 | 类型定义存在但无配置字段 | 无（直接 exitNode） | ❌ 未实现（有害） |
+| 全局跨 Channel 限频 | 所有 | 未设计 | 无 | ❌ 不存在 |
+
+### 10.7 最终结论
+
+**已落地的核心能力**：
+- ✅ 统一的消息发送抽象（`sendMessage` + `BackendMessageSendResult`）
+- ✅ 三层错误分类（配置错误/服务失败/消息跳过）
+- ✅ 两层重试机制（SignalWire 可重试识别 + Temporal 工作流重试）
+- ✅ Broadcast V2 基于 sleep 的 QPS 限频（支持暂停/恢复）
+
+**当前架构的关键边界**：
+1. **MobilePush 是二等公民**：`sendMessage` 抛出"not implemented"，Broadcast V2 不支持，Journey 编辑器禁用
+2. **"跨 channel 限频"是伪命题**：Broadcast 单 channel 设计，没有全局协调器，SMS 和 Push 之间不存在需要协调的场景
+3. **RateLimitNode 是陷阱**：类型定义存在但执行时直接退出 Journey，不仅无用反而有害
+
+**最短路径改进建议**：
+1. **P0 必做**：修正 MobilePush throw 为 `Result.err()`，避免 3 次无意义重试
+2. **P1 高价值**：完善 Twilio 可重试判断，这是当前最大的单点缺陷
+3. **P1 高价值**：修复 RateLimitNode（或从类型中移除），避免用户 Journey 意外终止
+4. **P2 可选**：Provider 间 Failover 和全局限频协调器在当前业务规模下优先级较低
