@@ -1216,12 +1216,17 @@ return null;
 │  │ isRunnable 检查 (精确逻辑)                                           │   │
 │  │ ┌─────────────────────────────────────────────────────────────┐     │   │
 │  │ │ previousExitEvent === null (首次进入)                        │     │   │
-│  │ │   → return true (不检查 journey/workspace)                  │     │   │
+│  │ │   → return true (不检查任何条件)                            │     │   │
 │  │ │                                                             │     │   │
 │  │ │ previousExitEvent 存在                                       │     │   │
+│  │ │   → workspaceId 不传 → workspace = null →                   │     │   │
+│  │ │       workspace?.status = undefined →                       │     │   │
+│  │ │       undefined !== "Active" = true → return false        │     │   │
+│  │ │   → workspace 不存在 → workspace = null →                  │     │   │
+│  │ │       workspace?.status = undefined → return false        │     │   │
+│  │ │   → workspace.status 非 Active → return false              │     │   │
 │  │ │   → journey 不存在 → canRunMultiple = false → return false  │     │   │
 │  │ │   → journey.canRunMultiple = false → return false           │     │   │
-│  │ │   → workspace 不存在/非 Active → return false               │     │   │
 │  │ │   → 其他 → return true                                      │     │   │
 │  │ └─────────────────────────────────────────────────────────────┘     │   │
 │  │                                                                     │   │
@@ -1466,6 +1471,50 @@ return null;
    ```
 2. 旅程不存在 → 返回 `err(BadWorkspaceConfiguration.JourneyNotFound)`
 3. `sendMessageWithSender` 转换 `isErr() → shouldContinue = false`
+
+### 场景五: workspaceId 缺失场景（非首次进入）
+
+**前提**: 用户之前已经运行过该旅程（`previousExitEvent` 存在）
+
+**情况 A: workspaceId 未传入**
+
+1. **isRunnable 调用**: 假设某历史代码调用 `isRunnable({ journeyId, userId })`（未传 workspaceId）
+2. **workspace 变量赋值**:
+   ```typescript
+   workspaceId  // undefined
+     ? db().query.workspace.findFirst(...)
+     : null  // 三元表达式返回 null
+   ```
+3. **workspace 检查**:
+   ```typescript
+   workspace  // null
+   workspace?.status  // undefined (可选链返回 undefined)
+   undefined !== "Active"  // true
+   ```
+4. **结果**: 返回 `false` → 工作流直接退出
+
+**情况 B: workspaceId 传入但 workspace 不存在**
+
+1. **isRunnable 调用**: `isRunnable({ journeyId, userId, workspaceId: "invalid-id" })`
+2. **数据库查询**:
+   ```typescript
+   db().query.workspace.findFirst({
+     where: eq(dbWorkspace.id, "invalid-id")
+   })  // 返回 null
+   ```
+3. **workspace 检查**:
+   ```typescript
+   workspace  // null
+   workspace?.status  // undefined
+   undefined !== "Active"  // true
+   ```
+4. **结果**: 返回 `false` → 工作流直接退出
+
+**关键点**:
+- `workspaceId` 是可选参数（注释中说明是为了向后兼容）
+- 不传 `workspaceId` **不会跳过** workspace 状态检查
+- 不传 `workspaceId` → `workspace = null` → `workspace?.status = undefined` → `undefined !== "Active" = true` → **返回 false**
+- 这是一个保护机制：确保所有非首次进入的旅程都有有效的 workspace 上下文
 
 ### 场景六: ContinueAsNew（循环旅程）
 
