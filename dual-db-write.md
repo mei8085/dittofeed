@@ -82,7 +82,7 @@ DittoFeed 采用 ClickHouse + PostgreSQL 双数据库架构，实现不同数据
 │  执行顺序：                                                              │
 │    1. Promise.all([                                                      │
 │         triggerSegmentEntryJourney(),    // 触发 Journey 下游           │
-│         startHubspotUserIntegration()    // 触发 Integration 下游        │
+│         startHubspotUserIntegrationWorkflow()    // 触发 Integration 下游        │
 │       ])                                                                 │
 │    2. await insertProcessedComputedProperties()  // 写入处理记录         │
 │                                                                         │
@@ -1031,8 +1031,9 @@ ORDER BY (
 
 阶段三再次调度（now=T4）：
     ├─ periodBound = T3
-    ├─ 处理范围：T3 < computed_at <= T4
-    ├─ 只处理新状态
+    ├─ lowerBoundClause: computed_at >= T3
+    ├─ 截止条件：computed_at <= T4
+    ├─ 只处理 computed_at >= T3 的状态记录
     └─ 写入 Period 表：from=T3, to=T4
 ```
 
