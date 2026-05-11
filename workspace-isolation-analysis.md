@@ -2079,6 +2079,551 @@ for (const event of sendgridEvents) {
 | P2 | 签名验证前置（如果有 immediate events） | 性能/安全 | 中 |
 | P3 | 方案 A：按 workspaceId 分组处理 | 完整性 | 高 |
 
+### 11.14 延迟回填的键设计边界分析
+
+#### 11.14.1 问题背景
+
+SendGrid 延迟事件（bounce/spamreport）的处理依赖两个关键设计：
+1. `delayedEvents` Map：以 `smtp-id` 为键存储延迟事件
+2. messageId 命名约定：`processed:${smtp-id}`、`bounce:${smtp-id}`
+
+这两个设计都缺少 workspace 维度，导致潜在的跨空间错配和事件丢失。
+
+#### 11.14.2 messageId 命名设计对比
+
+**位置**：`packages/backend-lib/src/destinations/sendgrid.ts:102-136`
+
+```typescript
+switch (event) {
+  case "processed":
+    if (!smtpId) {
+      return err(new Error("Missing smtp-id for processed event."));
+    }
+    messageId = `processed:${smtpId}`;  // ⚠️ 没有 workspace 维度！
+    break;
+  case "bounce":
+    if (!smtpId) {
+      return err(new Error("Missing smtp-id for bounce event."));
+    }
+    messageId = `bounce:${smtpId}`;  // ⚠️ 没有 workspace 维度！
+    break;
+  case "spamreport":
+    if (!smtpId) {
+      return err(new Error("Missing smtp-id for spamreport event."));
+    }
+    messageId = `spamreport:${smtpId}`;  // ⚠️ 没有 workspace 维度！
+    break;
+  default: {
+    if (!sendgridEvent.workspaceId || !sg_message_id) {
+      return err(
+        new Error(
+          `Missing workspaceId or sg_message_id for event: ${event}.`,
+        ),
+      );
+    }
+    // ✅ immediate events 使用 workspaceId 作为 namespace
+    messageId = uuidv5(
+      `${event}:${sg_message_id}`,
+      sendgridEvent.workspaceId,  // ⬅️ 关键差异！
+    );
+    break;
+  }
+}
+```
+
+**设计对比表**：
+
+| 事件类型 | messageId 生成公式 | workspace 维度 | 唯一性保证 |
+|---------|-------------------|---------------|-----------|
+| open/click/delivered/dropped | `uuidv5(event:sg_message_id, workspaceId)` | ✅ namespace | 强（UUID v5） |
+| processed | `processed:smtp-id` | ❌ 无 | 弱（仅 smtp-id） |
+| bounce | `bounce:smtp-id` | ❌ 无 | 弱（仅 smtp-id） |
+| spamreport | `spamreport:smtp-id` | ❌ 无 | 弱（仅 smtp-id） |
+
+**关键差异**：
+- **uuidv5**：两个不同 workspace 即使有相同的 `sg_message_id`，生成的 messageId 也不同（因为 namespace 不同）
+- **字符串拼接**：两个不同 workspace 有相同的 `smtp-id`，就会有相同的 messageId
+
+#### 11.14.3 delayedEvents Map 设计缺陷
+
+**位置**：`packages/backend-lib/src/destinations/sendgrid.ts:241-259`
+
+```typescript
+const delayedEvents = new Map<string, SendgridEvent>();  // ⚠️ 单一值！
+
+for (const event of sendgridEvents) {
+  switch (event.event) {
+    case "spamreport":
+    case "bounce":
+      if (!event["smtp-id"]) {
+        // ... 日志
+        continue;
+      }
+      delayedEvents.set(event["smtp-id"], event);  // ⚠️ 后设置的覆盖先设置的！
+      break;
+    // ...
+  }
+}
+```
+
+**问题 1：同批次同 smtp-id 多事件覆盖**
+
+```
+同批次事件：
+  Event 1: bounce, smtp-id = "smtp-abc-123", bounce_type = "hard"
+  Event 2: spamreport, smtp-id = "smtp-abc-123"
+
+执行：
+  delayedEvents.set("smtp-abc-123", bounceEvent);     // Map: {"smtp-abc-123" → bounce}
+  delayedEvents.set("smtp-abc-123", spamreportEvent);  // Map: {"smtp-abc-123" → spamreport} 覆盖！
+
+结果：bounceEvent 丢失 ❌
+```
+
+**问题 2：后续查询只查一次**
+
+```typescript
+// 只去重后的键
+const processedForDelayedEvents = await findUserEventsById({
+  messageIds: Array.from(delayedEvents.keys()).map((id) => `processed:${id}`),
+});
+
+// 遍历结果匹配
+for (const event of processedForDelayedEvents) {
+  const smtpId = event.message_id.split(":")[1];
+  const delayedEvent = delayedEvents.get(smtpId);  // 只返回一个事件！
+  // ...
+}
+```
+
+即使 `processedForDelayedEvents` 返回了多个 workspace 的 `processed:smtp-id` 事件，也只能匹配到一个 delayedEvent。
+
+### 11.15 可复现的键设计边界问题
+
+#### 场景 G：同批次同 smtp-id 多事件被覆盖
+
+**严重级别**：🟡 中（事件丢失）
+
+**前提条件**：
+- 同一邮件发送后，SendGrid 推送多个延迟事件
+- 常见组合：`bounce + spamreport`、多次 `bounce` 通知
+
+**触发条件**：
+1. 邮件发送 → SendGrid 记录 `processed` 事件
+2. 邮件被退回 → SendGrid 推送 `bounce` 事件
+3. 用户举报垃圾邮件 → SendGrid 推送 `spamreport` 事件
+4. 由于网络延迟，两个事件在**同一批次**到达
+
+**批次内容示例**：
+```json
+[
+  {
+    "event": "bounce",
+    "email": "hard@bounce.com",
+    "timestamp": 1715000001,
+    "smtp-id": "<smtp-multi-001@dittofeed>",
+    "bounce_type": "hard",
+    "status": "5.1.1"
+  },
+  {
+    "event": "spamreport",
+    "email": "user@spam.com",
+    "timestamp": 1715000002,
+    "smtp-id": "<smtp-multi-001@dittofeed>"  // ⚠️ 相同的 smtp-id！
+  }
+]
+```
+
+**执行流程**：
+
+```
+Step 1: 推断 workspaceId
+  两个事件都没有 workspaceId（延迟事件）
+  workspaceId = undefined
+
+Step 2: 分类事件
+  Event 1 (bounce, smtp-id = "<smtp-multi-001@dittofeed>"):
+    delayedEvents.set("<smtp-multi-001@dittofeed>", bounceEvent)
+    // Map: { "<smtp-multi-001@dittofeed>" → bounceEvent }
+
+  Event 2 (spamreport, smtp-id = "<smtp-multi-001@dittofeed>"):
+    delayedEvents.set("<smtp-multi-001@dittofeed>", spamreportEvent)
+    // Map: { "<smtp-multi-001@dittofeed>" → spamreportEvent }  ⚠️ 覆盖！
+
+  结果：delayedEvents = { "<smtp-multi-001@dittofeed>" → spamreportEvent }
+        // bounceEvent 丢失！
+
+Step 3: 延迟事件回填
+  messageIds = ["processed:<smtp-multi-001@dittofeed>"]
+
+  假设查询到 processed 事件，workspaceId = ws-a
+  backfilledDelayedEvents = [spamreportEvent 回填后的数据]
+
+Step 4: 写入
+  只有 spamreport 事件被写入
+  // bounce 事件永久丢失 ❌
+```
+
+**后果**：
+- bounce 事件丢失，无法记录邮件失败原因
+- 发送者声誉和退信率统计不准确
+- 影响后续邮件发送策略（如自动停止发送到硬退信地址）
+
+#### 场景 H：不同 workspace 相同 smtp-id 导致匹配歧义
+
+**严重级别**：🟡 中（跨空间错配）
+
+**前提条件**：
+1. Workspace A 和 Workspace B 的邮件恰好有相同的 `smtp-id`（理论可能）
+2. 两个 workspace 的 `processed` 事件 messageId 都是 `processed:smtp-123`
+3. 没有 immediate events（只有延迟事件）
+
+**触发流程**：
+1. Workspace A 的 bounce 事件到达，`smtp-id = "smtp-123"`
+2. `findUserEventsById({ messageIds: ["processed:smtp-123"] })`
+
+**ClickHouse 查询**：
+```sql
+SELECT * FROM user_events_v2
+WHERE message_id IN ('processed:smtp-123')
+-- ⚠️ 没有 workspace_id 过滤！
+```
+
+**可能的查询结果**（取决于 ClickHouse 存储顺序）：
+
+```
+返回记录 1:
+  workspace_id = ws-b
+  message_id = processed:smtp-123
+  properties = { workspaceId: "ws-b", userId: "user-b", ... }
+
+返回记录 2:
+  workspace_id = ws-a
+  message_id = processed:smtp-123
+  properties = { workspaceId: "ws-a", userId: "user-a", ... }
+```
+
+**后续处理**：
+
+```
+遍历 processedForDelayedEvents:
+
+  第 1 条 (ws-b):
+    processedWorkspaceId = "ws-b"
+    workspaceId = undefined → 设置为 "ws-b" ✓
+    backfilledDelayedEvents.push(bounce 事件 + ws-b metadata)
+
+  第 2 条 (ws-a):
+    processedWorkspaceId = "ws-a"
+    workspaceId = "ws-b" → 不匹配 ❌
+    continue（跳过）
+```
+
+**最终结果**：
+
+| 实际归属 | 推断归属 | 结果 |
+|---------|---------|------|
+| Workspace A 的 bounce | Workspace B 处理 | ❌ 错配！ |
+
+**后果**：
+- Workspace A 的 bounce 事件被标记为 Workspace B 的
+- 或者如果 B 的密钥签名验证失败，事件完全丢失
+- 取决于签名验证的 workspaceId
+
+#### 场景 I：父子工作空间 smtp-id 冲突
+
+**严重级别**：🟡 中（数据归属问题）
+
+**前提条件**：
+- Parent P 有子工作空间 C1、C2
+- C1 和 C2 的邮件恰好有相同的 smtp-id
+- C1 的 processed 事件先被查询到
+
+**结果**：
+- C2 的 bounce 事件会被错误地与 C1 的 processed 事件匹配
+- 或者被跳过（因为 workspaceId 校验）
+- 在 Parent 层面可能看不到问题（`buildWorkspaceIdClause` 包含所有子空间）
+- 但在子工作空间层面，事件归属错误
+
+### 11.16 键设计修复方案
+
+#### 方案 1（P0）：修复 delayedEvents Map 覆盖问题
+
+**复杂度**：低
+**影响**：事件完整性
+
+**当前设计**：
+```typescript
+const delayedEvents = new Map<string, SendgridEvent>();
+delayedEvents.set(event["smtp-id"], event);  // 后设置的覆盖先设置的
+```
+
+**修复方案**：
+```typescript
+const delayedEvents = new Map<string, SendgridEvent[]>();  // 改为数组
+
+for (const event of sendgridEvents) {
+  switch (event.event) {
+    case "spamreport":
+    case "bounce":
+      if (!event["smtp-id"]) {
+        // ...
+        continue;
+      }
+      const smtpId = event["smtp-id"];
+      const existing = delayedEvents.get(smtpId) ?? [];
+      delayedEvents.set(smtpId, [...existing, event]);  // 追加而非覆盖
+      break;
+    // ...
+  }
+}
+
+// 后续处理也需要修改
+const backfilledDelayedEvents: SendgridEvent[] = [];
+
+for (const event of processedForDelayedEvents) {
+  const smtpId = event.message_id.split(":")[1];
+  if (!smtpId) continue;
+
+  const delayedEventList = delayedEvents.get(smtpId);
+  if (!delayedEventList || delayedEventList.length === 0) continue;
+
+  const parsedProperties = jsonParseSafeWithSchema(
+    event.properties,
+    MessageMetadataFields,
+  );
+  if (parsedProperties.isErr()) continue;
+
+  const { workspaceId: processedWorkspaceId, userId } = parsedProperties.value;
+  if (!processedWorkspaceId || !userId) continue;
+
+  if (!workspaceId) {
+    workspaceId = processedWorkspaceId;
+  }
+  if (workspaceId !== processedWorkspaceId) {
+    continue;
+  }
+
+  // 为每个匹配的延迟事件回填
+  for (const delayedEvent of delayedEventList) {
+    backfilledDelayedEvents.push({
+      ...delayedEvent,
+      ...parsedProperties.value,
+    });
+  }
+
+  // 处理完后可以移除，避免重复处理
+  delayedEvents.delete(smtpId);
+}
+```
+
+**优点**：
+1. 最小化改动（约 10-15 行）
+2. 解决同 smtp-id 多事件覆盖问题
+3. 不影响现有逻辑的其他部分
+
+**缺点**：
+- 如果多个 workspace 有相同 smtp-id 的 processed 事件，可能重复匹配
+- 需要配合方案 2 或 3 一起使用
+
+#### 方案 2（P1）：为 processed 事件的 messageId 添加 workspace 维度
+
+**复杂度**：中
+**影响**：跨空间隔离
+
+**当前设计**：
+```typescript
+case "processed":
+  messageId = `processed:${smtpId}`;  // 无 workspace 维度
+```
+
+**问题**：
+- `processed` 事件本身是否有 `workspaceId`？
+- 从 `sendgridEventToDF` 看，`processed` 事件不要求 `workspaceId`（走 case 而非 default）
+- 但在 `handleSendgridEvents` 中，`processed` 被归类为 immediate event
+
+**修复方案**：
+```typescript
+case "processed":
+  if (!smtpId) {
+    return err(new Error("Missing smtp-id for processed event."));
+  }
+  // 如果有 workspaceId，使用 uuidv5 生成唯一 messageId
+  if (sendgridEvent.workspaceId) {
+    messageId = uuidv5(`processed:${smtpId}`, sendgridEvent.workspaceId);
+  } else {
+    // 保持向后兼容
+    messageId = `processed:${smtpId}`;
+  }
+  break;
+```
+
+**问题**：
+- 查询时也需要用相同的方式生成 messageId
+- 需要知道 workspaceId 才能生成正确的 messageId
+- 但延迟事件场景中，我们还不知道 workspaceId（这是我们要查找的）
+
+**这是一个鸡生蛋问题**：
+- 延迟事件没有 workspaceId
+- 需要通过 smtp-id 查找 processed 事件来获取 workspaceId
+- 如果 processed 事件的 messageId 包含 workspaceId，我们怎么生成它？
+
+**结论**：方案 2 不适用于延迟回填场景，因为查询时还不知道 workspaceId。
+
+#### 方案 3（P1）：在 findUserEventsById 中传递 workspaceId
+
+**复杂度**：中
+**影响**：查询隔离
+
+**问题**：
+- 当前 `findUserEventsById` 不传递 workspaceId
+- 导致跨 workspace 查询
+
+**修复方案**：
+
+首先，尝试从 immediate events 获取 workspaceId：
+```typescript
+let workspaceId: string | undefined;
+for (const event of sendgridEvents) {
+  if (event.workspaceId) {
+    workspaceId = event.workspaceId;
+    break;
+  }
+}
+
+// 传递 workspaceId（如果有）
+const processedForDelayedEvents = await findUserEventsById({
+  messageIds: Array.from(delayedEvents.keys()).map((id) => `processed:${id}`),
+  workspaceId,  // 新增：传递 workspaceId
+});
+```
+
+**如果没有 immediate events**（只有延迟事件）：
+- 仍然无法传递 workspaceId
+- 只能依赖后置校验
+
+**优点**：
+1. 有 immediate events 时，可以精准查询
+2. 利用 ClickHouse 排序键（workspace_id 是首位），查询性能更好
+
+**缺点**：
+1. 只有延迟事件时，仍然无法避免跨空间查询
+2. 需要配合其他方案
+
+#### 方案 4（P2）：查询时按 workspace_id 分组处理
+
+**复杂度**：高
+**影响**：完整解决方案
+
+**设计思路**：
+1. 查询时不传递 workspaceId，允许跨空间返回
+2. 遍历结果时，按 `processedWorkspaceId` 分组
+3. 每组独立签名验证和写入
+
+```typescript
+// 按 workspaceId 分组
+const byWorkspace = new Map<string, { processed: any[], delayed: SendgridEvent[] }>();
+
+for (const event of processedForDelayedEvents) {
+  const parsedProperties = jsonParseSafeWithSchema(...);
+  if (parsedProperties.isErr()) continue;
+
+  const { workspaceId: processedWorkspaceId, userId } = parsedProperties.value;
+  if (!processedWorkspaceId || !userId) continue;
+
+  const smtpId = event.message_id.split(":")[1];
+  if (!smtpId) continue;
+  const delayedEvent = delayedEvents.get(smtpId);
+  if (!delayedEvent) continue;
+
+  const group = byWorkspace.get(processedWorkspaceId) ?? { processed: [], delayed: [] };
+  group.processed.push(event);
+  group.delayed.push({ ...delayedEvent, ...parsedProperties.value });
+  byWorkspace.set(processedWorkspaceId, group);
+}
+
+// 每组独立签名验证和写入
+for (const [wsId, { delayed }] of byWorkspace) {
+  // 1. 查询 wsId 的 secret
+  // 2. 验证签名（如果签名是按请求签名，这里可能有问题）
+  // 3. 写入事件
+  await submitSendgridEvents({ workspaceId: wsId, events: delayed });
+}
+```
+
+**问题**：
+- SendGrid 签名是按整个 HTTP 请求签名的
+- 不是按事件或按 workspace 签名的
+- 如果请求中包含多个 workspace 的事件，签名验证需要特殊处理
+
+#### 方案 5（P1）：增强 smtp-id 与 workspace 关联查询
+
+**复杂度**：中
+**影响**：查询准确性
+
+**设计思路**：
+1. 查询时获取所有匹配的 processed 事件
+2. 但在后置校验时，同时校验 `smtp-id` 和 `workspaceId`
+3. 如果有多个匹配，选择正确的一个
+
+**当前问题**：
+- ClickHouse 返回顺序不确定
+- 第一个匹配的会被设为 `workspaceId`
+- 后续匹配的会被跳过
+
+**改进方案**：
+```typescript
+// 先收集所有可能的 workspaceId
+const candidateWorkspaceIds = new Set<string>();
+const processedBySmtpId = new Map<string, any[]>();
+
+for (const event of processedForDelayedEvents) {
+  const parsedProperties = jsonParseSafeWithSchema(...);
+  if (parsedProperties.isErr()) continue;
+
+  const { workspaceId: processedWorkspaceId } = parsedProperties.value;
+  if (!processedWorkspaceId) continue;
+
+  const smtpId = event.message_id.split(":")[1];
+  if (!smtpId) continue;
+
+  const list = processedBySmtpId.get(smtpId) ?? [];
+  list.push({ event, parsedProperties });
+  processedBySmtpId.set(smtpId, list);
+  candidateWorkspaceIds.add(processedWorkspaceId);
+}
+
+// 如果只有一个候选 workspaceId，直接使用
+if (candidateWorkspaceIds.size === 1) {
+  workspaceId = [...candidateWorkspaceIds][0];
+}
+// 如果有多个，需要额外判断
+else if (candidateWorkspaceIds.size > 1) {
+  logger().warn(
+    { candidateWorkspaceIds: [...candidateWorkspaceIds] },
+    "Multiple workspaceIds found for delayed events",
+  );
+  // 可以：
+  // 1. 只处理 workspaceId 明确的事件
+  // 2. 或者记录告警后全部跳过
+}
+```
+
+### 11.17 修复方案推荐优先级
+
+| 优先级 | 方案 | 解决问题 | 改动量 | 风险 |
+|--------|------|---------|--------|------|
+| P0 | 方案 1：delayedEvents Map 支持数组 | 同批次同 smtp-id 多事件覆盖 | 低 | 低 |
+| P1 | 方案 3：传递 workspaceId 到 findUserEventsById | 有 immediate events 时的精准查询 | 低 | 低 |
+| P1 | 方案 5：增强候选 workspaceId 处理 | 多 workspace 匹配歧义 | 中 | 中 |
+| P2 | 方案 4：按 workspace 分组独立处理 | 完整解决跨空间问题 | 高 | 中 |
+
+**推荐实施顺序**：
+1. **立即**：实施方案 1（修复事件丢失）
+2. **短期**：实施方案 3（提升查询精准度和性能）
+3. **中期**：实施方案 5（增强多 workspace 匹配处理）
+4. **长期**：评估方案 4（完整重构）
+
 ---
 
 ## 十二、关键代码文件索引
