@@ -188,6 +188,133 @@ if (!canWorkspaceReceiveEvents({ workspace: writeKeySecret.workspace })) {
    - 直接返回 `400 Bad Request`
    - 警告日志：`"Client is calling unimplemented endpoint /alias"`
 
+### 3.2.4 ValidateWriteKey 错误类型可达性分析
+
+`ValidateWriteKeyError` 类型在 `auth.ts:64-67` 中声明了三个变体：
+
+```typescript
+export type ValidateWriteKeyError =
+  | "InvalidWriteKey"
+  | "WorkspaceInactive"
+  | "WorkspaceIneligible";
+```
+
+但在 `validateWriteKey` 函数的实际实现中（`auth.ts:75-116`），只有两个错误类型是可达的：
+
+| 错误类型 | 类型声明 | 运行时可达 | 触发条件 |
+|---------|---------|-----------|---------|
+| `InvalidWriteKey` | ✅ 声明 | ✅ 可达 | 1. Authorization header 格式错误<br>2. secretKeyId 不是有效 UUID<br>3. secretKeyId 不存在于数据库<br>4. secretKeyValue 不匹配 |
+| `WorkspaceInactive` | ✅ 声明 | ❌ **不可达** | 被 `canWorkspaceReceiveEvents` 统一返回 `WorkspaceIneligible` |
+| `WorkspaceIneligible` | ✅ 声明 | ✅ 可达 | 1. workspace.status !== Active<br>2. workspace.type === "Parent" |
+
+**WorkspaceInactive 不可达的证据**：
+
+`validateWriteKey` 函数调用 `canWorkspaceReceiveEvents` 进行 Workspace 检查：
+
+```typescript
+// auth.ts:108-110
+if (!canWorkspaceReceiveEvents({ workspace: writeKeySecret.workspace })) {
+  return err("WorkspaceIneligible");  // ⭐ 只返回 WorkspaceIneligible
+}
+```
+
+`canWorkspaceReceiveEvents` 的实现（`auth.ts:39-48`）：
+
+```typescript
+export function canWorkspaceReceiveEvents({
+  workspace,
+}: {
+  workspace: Workspace;
+}): boolean {
+  return (
+    workspace.status === WorkspaceStatusDbEnum.Active &&
+    workspace.type !== "Parent"
+  );
+}
+```
+
+**结论**：
+- `workspace.status !== Active`（非活跃） → 返回 `err("WorkspaceIneligible")`
+- `workspace.type === "Parent"` → 返回 `err("WorkspaceIneligible")`
+- **`"WorkspaceInactive"` 错误类型从未被返回**，它是类型声明中的历史遗留
+
+> 注意：`WorkspaceInactive` 在 `requestContext.ts` 中的用户认证场景是可达的，但在 Write Key 鉴权场景中不可达。
+
+### 3.2.5 各入口 401/400 返回体差异详解
+
+#### 401 鉴权失败返回体
+
+当 `validateWriteKey` 返回错误时，各入口的 HTTP 401 返回体：
+
+| 入口 | HTTP 状态码 | 返回体 | 原因 |
+|-----|------------|-------|------|
+| identify | 401 | `{ "message": "InvalidWriteKey" }` 或 `{ "message": "WorkspaceIneligible" }` | 直接返回 `workspaceIdFromWriteKey.error` |
+| track | 401 | `{ "message": "Invalid write key." }` | **硬编码**，隐藏具体错误类型 |
+| page | 401 | `{ "message": "InvalidWriteKey" }` 或 `{ "message": "WorkspaceIneligible" }` | 直接返回 `workspaceIdFromWriteKey.error` |
+| screen | 401 | `{ "message": "InvalidWriteKey" }` 或 `{ "message": "WorkspaceIneligible" }` | 直接返回 `workspaceIdFromWriteKey.error` |
+| group | 401 | `{ "message": "InvalidWriteKey" }` 或 `{ "message": "WorkspaceIneligible" }` | 直接返回 `workspaceIdFromWriteKey.error` |
+| alias | 无 401 | - | **完全跳过鉴权**，直接返回 400 |
+| batch | 401 | `{ "message": "InvalidWriteKey" }` 或 `{ "message": "WorkspaceIneligible" }` | 直接返回 `workspaceIdFromWriteKey.error` |
+
+**track 入口硬编码证据**（`publicAppsController.ts:89-105`）：
+
+```typescript
+const workspaceIdFromWriteKey = await validateWriteKey({
+  writeKey: request.headers.authorization,
+});
+
+if (workspaceIdFromWriteKey.isErr()) {
+  return reply.status(401).send({
+    message: "Invalid write key.",  // ⭐ 硬编码，不使用 error
+  });
+}
+```
+
+**其他入口（如 identify）**（`publicAppsController.ts:140-153`）：
+
+```typescript
+const workspaceIdFromWriteKey = await validateWriteKey({
+  writeKey: request.headers.authorization,
+});
+
+if (workspaceIdFromWriteKey.isErr()) {
+  return reply.status(401).send({
+    message: workspaceIdFromWriteKey.error,  // ⭐ 使用具体错误类型
+  });
+}
+```
+
+#### 400 返回体
+
+| 入口 | HTTP 状态码 | 返回体 | 触发原因 |
+|-----|------------|-------|---------|
+| identify | 无 400 | - | 只处理鉴权失败（401）和成功（204） |
+| track | 无 400 | - | 只处理鉴权失败（401）和成功（204） |
+| page | 无 400 | - | 只处理鉴权失败（401）和成功（204） |
+| screen | 无 400 | - | 只处理鉴权失败（401）和成功（204） |
+| group | 无 400 | - | 只处理鉴权失败（401）和成功（204） |
+| alias | 400 | `{ "message": "Not yet implemented." }` | **端点未实现**，无前置鉴权 |
+| batch | 无 400 | - | 只处理鉴权失败（401）和成功（204） |
+
+**alias 入口未实现证据**（`publicAppsController.ts:155-167`）：
+
+```typescript
+fastify.withTypeProvider<TypeBoxTypeProvider>().post(
+  "/alias",
+  async (request, reply) => {
+    logger().warn("Client is calling unimplemented endpoint /alias");
+    return reply.status(400).send({
+      message: "Not yet implemented.",  // ⭐ 直接返回，无 validateWriteKey 调用
+    });
+  },
+);
+```
+
+**关键观察**：
+- `alias` 是唯一返回 400 的公共入口
+- `alias` **不调用 `validateWriteKey`**，因此即使 Write Key 无效也不会返回 401
+- `track` 是唯一硬编码错误消息的入口，隐藏了 `InvalidWriteKey` vs `WorkspaceIneligible` 的差异
+
 ### 3.3 入口处理逻辑差异
 
 #### 3.3.1 track 与 batch 的 Journey 触发
