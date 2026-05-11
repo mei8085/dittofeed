@@ -173,7 +173,8 @@ export async function isRunnable({
   // 注意：journey 不存在时 journey?.canRunMultiple 是 undefined，!!undefined = false
   const canRunMultiple = !!journey?.canRunMultiple;
 
-  // workspace 检查（workspaceId 是可选参数）
+  // workspace 检查（workspaceId 是可选参数，但不传时 workspace = null，
+  // 导致 workspace?.status = undefined，undefined !== "Active" 为 true，返回 false）
   if (workspace?.status !== "Active") {
     return false;
   }
@@ -183,14 +184,15 @@ export async function isRunnable({
 
 **isRunnable 精确逻辑判定表**:
 
-| previousExitEvent | journey 存在 | journey.canRunMultiple | workspace 存在 | workspace.status | 返回值 | 说明 |
-|------------------|-------------|----------------------|---------------|----------------|-------|------|
-| null (无) | 任意 | 任意 | 任意 | 任意 | `true` | **首次进入，不检查 journey/workspace** |
-| 存在 | 是 | true | 是 | Active | `true` | 允许重复运行 |
-| 存在 | 是 | true | 是 | 非 Active | `false` | 工作空间不活跃 |
-| 存在 | 是 | true | 否 | - | `false` | 工作空间不存在 |
-| 存在 | 是 | false | 任意 | 任意 | `false` | 不允许重复运行 |
-| 存在 | 否 | - | 任意 | 任意 | `false` | 旅程不存在 → `canRunMultiple = false` |
+| previousExitEvent | workspaceId 传入 | workspace 存在 | workspace.status | journey 存在 | journey.canRunMultiple | 返回值 | 说明 |
+|------------------|-----------------|---------------|----------------|-------------|----------------------|-------|------|
+| null (首次进入) | 任意 | 任意 | 任意 | 任意 | 任意 | `true` | **首次进入，不检查任何条件** |
+| 存在 | 否 | `null`（未查询） | N/A | 任意 | 任意 | `false` | **workspaceId 不传 → workspace = null → workspace?.status = undefined → undefined !== "Active" → 返回 false** |
+| 存在 | 是 | 否 | N/A | 任意 | 任意 | `false` | workspace 不存在 → workspace = null → 返回 false |
+| 存在 | 是 | 是 | 非 Active | 任意 | 任意 | `false` | 工作空间不活跃 |
+| 存在 | 是 | 是 | Active | 是 | true | `true` | 允许重复运行 |
+| 存在 | 是 | 是 | Active | 是 | false | `false` | 不允许重复运行 |
+| 存在 | 是 | 是 | Active | 否 | N/A | `false` | 旅程不存在 → `canRunMultiple = false` |
 
 **调用位置**:
 
