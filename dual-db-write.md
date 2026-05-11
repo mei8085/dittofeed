@@ -995,19 +995,20 @@ ORDER BY (
         (messageId=2, processing_time=T2)
 
 阶段二调度（now=T3）：
-    ├─ periodBound = 0（冷启动）
+    ├─ periodBound = 0（冷启动，无 lowerBoundClause）
     ├─ 处理范围：processing_time <= T3（全部）
     ├─ 写入 computed_property_state_v3: computed_at=T3
     └─ 写入 Period 表：to=T3, version=V1
 
 阶段二再次调度（now=T4）：
     ├─ periodBound = T3
-    ├─ 处理范围：T3 < processing_time <= T4
-    ├─ 只处理新事件（T3 之后写入的）
+    ├─ lowerBoundClause: processing_time >= T3
+    ├─ 截止条件：processing_time <= T4
+    ├─ 只处理 processing_time >= T3 的事件
     └─ 写入 Period 表：from=T3, to=T4
 ```
 
-**收敛点**：`period.maxTo` 单调递增，不会回退
+**收敛点**：`period.maxTo` 单调递增，`processing_time >= periodBound` 只增量处理新事件
 
 ---
 
