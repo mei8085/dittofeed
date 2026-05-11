@@ -2,11 +2,11 @@
 
 ## 1. 概述
 
-本文档深入分析 Dittofeed 中 Journey（用户旅程）工作流的三个核心机制：
+本文档深入分析 Dittofeed 中 Journey（用户旅程）工作流的三个核心机制及其协同关系：
 
 - **幂等性 (Idempotency)**: 确保相同事件处理多次时产生相同结果
 - **重试策略 (Retry)**: 处理异步活动失败时的恢复机制
-- **外部 Signal 交互**: 外部信号与正在运行的工作流步骤的互动方式
+- **外部 Signal 交互**: 外部取消、跳过、重发等信号与正在运行的工作流步骤的互动方式
 
 这三个机制协同工作，确保用户旅程的可靠性、一致性和可控性。
 
@@ -151,7 +151,7 @@ try {
 - 第一次调用：创建工作流并发送信号
 - 后续调用：捕获 `WorkflowExecutionAlreadyStartedError`，静默忽略
 
-**机制二: isRunnable 检查**
+**机制二: isRunnable 数据库检查**
 
 ```typescript
 // packages/backend-lib/src/journeys/userWorkflow/activities.ts:396-470
@@ -174,8 +174,18 @@ export async function isRunnable({
         inArray(dbUserJourneyEvent.type, Array.from(ENTRY_TYPES)),
       ),
     }),
+    db().query.journey.findFirst({
+      where: and(
+        eq(dbJourney.id, journeyId),
+        eq(dbJourney.workspaceId, workspaceId),
+      ),
+    }),
     ...
   ]);
+  
+  if (!journey) {
+    return false;
+  }
   
   if (!previousExitEvent) {
     return true;
@@ -193,7 +203,7 @@ export async function isRunnable({
 - 数据库中是否存在该用户+旅程（+事件键）的历史记录
 - 如果存在且旅程不允许重复运行（`canRunMultiple: false`），则工作流直接退出
 
-**机制三: 重复 Signal 去重**
+**机制三: 运行时 Signal 去重**
 
 ```typescript
 // packages/backend-lib/src/journeys/userWorkflow.ts:444-459
@@ -222,9 +232,9 @@ wf.setHandler(trackSignal, async (event) => {
 
 ---
 
-## 3. Temporal 异步活动重试策略
+## 3. 重试策略详解
 
-### 3.1 重试配置概览
+### 3.1 Temporal 活动重试配置
 
 Dittofeed 的活动重试策略基于 Temporal SDK，通过 `proxyActivities` 的 `retry` 参数配置。
 
@@ -257,7 +267,7 @@ const {
 | `getWorkspace` | startToClose: 2分钟 | `defaultUserJourneyMaxAttempts` | 工作空间检查 |
 | `getUserPropertyDelay`, `findNextLocalizedTime` | startToClose: 2分钟 | `defaultUserJourneyMaxAttempts` | 延迟计算 |
 
-#### 3.2.2 计算属性等待活动
+#### 3.2.2 计算属性等待活动 (长时运行)
 
 ```typescript
 // packages/backend-lib/src/journeys/userWorkflow.ts:239-245
@@ -297,7 +307,7 @@ const { getRandomNumber } = wf.proxyLocalActivities<...>({
 
 本地活动在 worker 进程内执行，不通过 Temporal 服务调度。
 
-#### 3.2.4 消息发送活动
+#### 3.2.4 消息发送活动 (节点级配置)
 
 ```typescript
 // packages/backend-lib/src/journeys/userWorkflow.ts:955-960
@@ -334,7 +344,9 @@ defaultGetSegmentAndEventDetailsMaxAttempts: parseMaxAttempts(
 | `defaultUserJourneyMaxAttempts` | 1 | undefined (Temporal 默认) |
 | `defaultGetSegmentAndEventDetailsMaxAttempts` | 1 | 10 |
 
-### 3.4 消息发送失败处理
+### 3.4 消息发送的重试与跳过协同
+
+消息发送失败后的处理流程涉及重试和跳过机制的协同：
 
 ```typescript
 // packages/backend-lib/src/journeys/userWorkflow/activities.ts:258-300
@@ -347,37 +359,99 @@ try {
 
   if (isLastAttempt) {
     logger().error("sender failed after maximum retry attempts", {...});
-    // 返回 MessageSkipped 而不是抛出
+    // 返回 JourneyEarlyExit 而不是抛出，让工作流决定下一步
     return err({
       type: InternalEventType.JourneyEarlyExit,
       message: `Message failed after maximum retry attempts: ${senderErrorString}`,
     });
   }
-  // 非最后一次尝试，重新抛出以触发重试
+  // 非最后一次尝试，重新抛出以触发 Temporal 重试
   throw senderError;
 }
 ```
 
-**策略**:
-- 非最后一次失败：抛出异常 → Temporal 自动重试
+**重试策略**:
+- 非最后一次失败：抛出异常 → Temporal 自动重试（指数退避）
 - 最后一次失败：返回 `JourneyEarlyExit` 错误 → 工作流根据 `skipOnFailure` 决定是否继续
 
 ```typescript
-// packages/backend-lib/src/journeys/userWorkflow.ts:961-970
+// packages/backend-lib/src/journeys/userWorkflow.ts:955-970
+const { sendMessageV2 } = proxyActivities<typeof activities>({
+  startToCloseTimeout: "2 minutes",
+  retry: {
+    maximumAttempts: currentNode.retryCount ?? 3,
+  },
+});
 const messageSucceeded = await sendMessageV2(sendMesssageParams);
 
 if (!messageSucceeded && !currentNode.skipOnFailure) {
-  logger.info("message node early exit", {...});
+  logger.info("message node early exit", {
+    ...defaultLoggingFields,
+    child: currentNode.child,
+  });
   nextNode = definition.exitNode;
   break;
 }
 ```
 
-如果消息发送最终失败：
-- `skipOnFailure: true` → 继续执行下一个节点
-- `skipOnFailure: false` → 跳转到退出节点，结束工作流
+**跳过决策**:
+- `skipOnFailure: true` → 消息失败后继续执行下一个节点（跳过失败）
+- `skipOnFailure: false` → 消息失败后跳转到退出节点（取消旅程）
 
-### 3.5 应用级重试 (非 Temporal 重试)
+### 3.5 消息跳过的类型 (MessageSkipped)
+
+除了重试失败后的跳过，还有两种消息跳过场景：
+
+```typescript
+// packages/isomorphic-lib/src/types.ts:4503-4506
+export enum MessageSkippedType {
+  SubscriptionState = "SubscriptionState",
+  MissingIdentifier = "MissingIdentifier",
+}
+```
+
+#### 3.5.1 SubscriptionState - 订阅状态跳过
+
+```typescript
+// packages/backend-lib/src/messaging.ts:422-435
+if (
+  subscriptionGroupDetails &&
+  !inSubscriptionGroup(subscriptionGroupDetails)
+) {
+  const { type: subscriptionGroupType, action: subscriptionGroupAction } =
+    subscriptionGroupDetails;
+  return err({
+    type: InternalEventType.MessageSkipped,
+    variant: {
+      type: MessageSkippedType.SubscriptionState,
+      action: subscriptionGroupAction,
+      subscriptionGroupType,
+    },
+  });
+}
+```
+
+**场景**: 用户取消订阅 (Unsubscribe) 或被加入退订列表，消息被跳过。
+
+#### 3.5.2 MissingIdentifier - 缺少标识符跳过
+
+```typescript
+// packages/backend-lib/src/messaging.ts:960-968
+const identifier = userPropertyAssignments[identifierKey];
+if (!identifier || typeof identifier !== "string") {
+  return err({
+    type: InternalEventType.MessageSkipped,
+    variant: {
+      type: MessageSkippedType.MissingIdentifier,
+      identifierKey,
+    },
+  });
+}
+```
+
+**场景**: 用户缺少发送消息所需的标识符（如 email、phone），消息被跳过。
+
+### 3.6 应用级重试 (非 Temporal 重试)
 
 ```typescript
 // packages/backend-lib/src/journeys/userWorkflow/activities.ts:104-137
@@ -409,9 +483,344 @@ export async function getEventsByIdWithRetry(
 
 ---
 
-## 4. 外部 Signal 与工作流步骤的互动
+## 4. 取消、跳过、重发与工作流步骤的协同
 
-### 4.1 Signal 定义概览
+### 4.1 取消机制 (Cancellation / Termination)
+
+#### 4.1.1 工作流 Terminate 调用
+
+Dittofeed 使用 Temporal 的 `terminate()` API 来强制终止工作流：
+
+```typescript
+// packages/backend-lib/src/computedProperties/computePropertiesWorkflow/lifecycle.ts:124-142
+export async function terminateComputePropertiesWorkflow({
+  workspaceId,
+}: {
+  workspaceId: string;
+}) {
+  const client = await connectWorkflowClient();
+  try {
+    await client
+      .getHandle(generateComputePropertiesId(workspaceId))
+      .terminate();
+  } catch (e) {
+    logger().info(
+      {
+        err: e,
+      },
+      "Failed to terminate compute properties workflow.",
+    );
+  }
+}
+```
+
+**终止场景**:
+- 工作空间禁用/删除
+- 计算属性工作流需要重置
+- 功能开关变更
+
+#### 4.1.2 工作空间状态检查 (软取消)
+
+在长时运行节点结束后，会检查工作空间状态：
+
+```typescript
+// packages/backend-lib/src/journeys/userWorkflow.ts:1100-1111
+const LONG_RUNNING_NODE_TYPES = new Set<JourneyNodeType>([
+  JourneyNodeType.WaitForNode,
+  JourneyNodeType.DelayNode,
+  JourneyNodeType.SegmentEntryNode,
+]);
+
+// check if workspace is inactive after a long running node
+if (LONG_RUNNING_NODE_TYPES.has(currentNode.type)) {
+  const workspace = await getWorkspace(workspaceId);
+  if (workspace?.status !== "Active") {
+    logger.info("workspace is not active, exiting journey", {
+      workspaceId,
+      userId,
+      journeyId,
+    });
+    break;
+  }
+}
+```
+
+**软取消机制**:
+- 工作流在长时运行节点（DelayNode、WaitForNode、SegmentEntryNode）结束后检查工作空间状态
+- 如果工作空间不再 Active，直接 `break` 退出 `nodeLoop`
+- 允许当前节点完成，然后优雅退出
+
+#### 4.1.3 旅程状态检查 (活动级别取消)
+
+在消息发送等活动中，会检查旅程是否仍然运行：
+
+```typescript
+// packages/backend-lib/src/journeys/userWorkflow/activities.ts:228-242
+if (!journey) {
+  return err({
+    type: InternalEventType.BadWorkspaceConfiguration,
+    variant: {
+      type: BadWorkspaceConfigurationType.JourneyNotFound,
+    },
+  });
+}
+
+if (!(journey.status === "Running" || journey.status === "Broadcast")) {
+  return err({
+    type: InternalEventType.JourneyEarlyExit,
+    message: `Journey is not running: ${journey.status}`,
+  });
+}
+```
+
+**活动级别取消**:
+- 旅程被禁用或删除后，活动返回 `JourneyEarlyExit`
+- 工作流收到后决定是否继续或退出
+
+#### 4.1.4 取消与 Signal 的交互
+
+当工作流正在 **WaitForNode** 或 **SegmentEntryNode** 等待时：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    工作流等待状态                                │
+│                                                                 │
+│  工作流正在执行: wf.condition(() => segmentAssignedTrue(segId))  │
+│                                                                 │
+│  同时可以接收 Signal:                                            │
+│  ├── segmentUpdateSignal → 更新 segmentAssignments              │
+│  ├── trackSignal → 追加事件并重新评估 segment                   │
+│  └── reEvaluateSegmentsSignal → 强制重新查询数据库              │
+│                                                                 │
+│  如果工作流被 terminate():                                      │
+│  ├── 正在执行的活动被取消                                        │
+│  ├── 工作流立即停止，不再处理任何节点                            │
+│  └── 不会触发后续节点的 onNodeProcessed                          │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 4.2 跳过机制 (Skip)
+
+#### 4.2.1 skipOnFailure - 消息发送失败后的跳过
+
+```typescript
+// packages/backend-lib/src/journeys/userWorkflow.ts:961-970
+const messageSucceeded = await sendMessageV2(sendMesssageParams);
+
+if (!messageSucceeded && !currentNode.skipOnFailure) {
+  logger.info("message node early exit", {
+    ...defaultLoggingFields,
+    child: currentNode.child,
+  });
+  nextNode = definition.exitNode;
+  break;
+}
+
+// 如果 skipOnFailure: true，继续执行下一个节点
+nextNode = nodes.get(currentNode.child) ?? null;
+```
+
+**跳过决策流程**:
+```
+消息发送活动调用
+       │
+       ▼
+┌───────────────┐     否     ┌─────────────────┐
+│ 消息发送成功?  │──────────▶│ 继续下一个节点  │
+└───────┬───────┘           └─────────────────┘
+        │
+        │ 是 (失败)
+        ▼
+┌───────────────┐     是     ┌─────────────────┐
+│ skipOnFailure?│──────────▶│ 跳过，继续下一节点│
+└───────┬───────┘           └─────────────────┘
+        │
+        │ 否
+        ▼
+┌───────────────────────┐
+│ nextNode = exitNode   │
+│ break nodeLoop        │
+│ (取消旅程)            │
+└───────────────────────┘
+```
+
+#### 4.2.2 跳过与重试的协同
+
+```typescript
+// packages/backend-lib/src/journeys/userWorkflow/activities.ts:270-300
+catch (senderError) {
+  const activityInfo = Context.current().info;
+  const isLastAttempt = activityInfo.attempt >= (retryCount ?? 3);
+
+  if (isLastAttempt) {
+    // 最后一次尝试失败，返回 JourneyEarlyExit
+    return err({
+      type: InternalEventType.JourneyEarlyExit,
+      message: `Message failed after maximum retry attempts`,
+    });
+  }
+  // 非最后一次，抛出异常触发 Temporal 重试
+  throw senderError;
+}
+```
+
+**重试与跳过的协同流程**:
+```
+第 N 次发送失败
+       │
+       ▼
+┌──────────────────────┐
+│ attempt >= retryCount│
+└──────────┬───────────┘
+           │
+     ┌─────┴─────┐
+     │ 否        │ 是
+     ▼           ▼
+┌─────────┐  ┌───────────────┐
+│抛出异常 │  │ JourneyEarlyExit│
+│Temporal │  │ 工作流决定    │
+│重试     │  │ skipOnFailure │
+└─────────┘  └───────┬───────┘
+                     │
+              ┌──────┴──────┐
+              │ true        │ false
+              ▼             ▼
+         ┌─────────┐   ┌─────────┐
+         │跳过继续 │   │取消旅程 │
+         └─────────┘   └─────────┘
+```
+
+### 4.3 重发机制 (Retry / Resend)
+
+#### 4.3.1 Temporal 活动级重试
+
+消息发送使用 Temporal SDK 的重试机制：
+
+```typescript
+// packages/backend-lib/src/journeys/userWorkflow.ts:955-960
+const { sendMessageV2 } = proxyActivities<typeof activities>({
+  startToCloseTimeout: "2 minutes",
+  retry: {
+    maximumAttempts: currentNode.retryCount ?? 3,
+  },
+});
+```
+
+**Temporal 重试特性**:
+- 指数退避 (Exponential Backoff)
+- 可配置 `maximumAttempts`（节点级 `retryCount` 或默认 3）
+- 失败活动在 worker 侧重试，不影响工作流历史
+
+#### 4.3.2 键控事件的 Signal 追加 (重发事件)
+
+当同一业务键的事件再次到达时，通过 `trackSignal` 追加到已运行的工作流：
+
+```typescript
+// packages/backend-lib/src/journeys/keyedEventEntry.test.ts:1415-1440
+// 测试场景：预约被取消，发送取消事件
+const cancelledEvent = {
+  type: EventType.Track,
+  event: "APPOINTMENT_UPDATE",
+  userId,
+  messageId: randomUUID(),
+  properties: {
+    operation: "CANCELLED",
+    appointmentId: appointmentId1,  // 同一 appointmentId
+  },
+  timestamp: new Date(cancelTime).toISOString(),
+} as const;
+
+await submitBatch({...});
+
+// 向已运行的工作流发送 signal
+await handle1.signal(trackSignal, {
+  version: TrackSignalParamsVersion.V2,
+  messageId: cancelledEvent.messageId,
+});
+```
+
+**工作流内部处理**:
+```typescript
+// packages/backend-lib/src/journeys/userWorkflow.ts:444-527
+wf.setHandler(trackSignal, async (event) => {
+  // 1. 去重检查
+  if (keyedEventIds.has(event.messageId)) {
+    logger.info("ignoring duplicate keyed event", {...});
+    return;
+  }
+  
+  // 2. 根据版本处理事件
+  switch (event.version) {
+    case TrackSignalParamsVersion.V2: {
+      // 从数据库加载完整事件
+      const newEvents = await getEventsById({
+        workspaceId,
+        eventIds: [event.messageId],
+      });
+      keyedEvents?.push(...newEvents);
+      keyedEventIds.add(event.messageId);
+      break;
+    }
+    // ...
+  }
+  
+  // 3. 如果在 WaitForNode，立即重新评估 segment
+  if (waitForSegmentIds) {
+    await Promise.all(
+      waitForSegmentIds.map(async ({ segmentId }) => {
+        const assignment = await getSegmentAssignmentHandler({...});
+        if (assignment === null) return;
+        segmentAssignments.set(segmentId, {...});
+      }),
+    );
+  }
+  reportWorkflowInfoHandler();
+});
+```
+
+**Signal 重发事件与工作流步骤的协同**:
+
+```
+工作流状态: 在 WaitForNode 等待 "appointment_cancelled" segment
+           (等待预约取消事件)
+
+步骤 1: 取消事件到达
+        └─▶ signalWithStart 或单独 signal 发送 trackSignal
+
+步骤 2: Signal Handler 执行
+        └─▶ 去重检查 keyedEventIds.has(messageId)
+        └─▶ 追加事件到 keyedEvents
+        └─▶ 添加到 keyedEventIds
+
+步骤 3: WaitForNode 中的 segment 重新评估
+        └─▶ waitForSegmentIds 不为 null (正在等待)
+        └─▶ 调用 getSegmentAssignmentHandler 重新查询
+        └─▶ 新事件可能使 segment 变为 true
+
+步骤 4: wf.condition 唤醒
+        └─▶ segmentAssignedTrue(segmentId) 返回 true
+        └─▶ 工作流继续执行 cancel 分支
+        └─▶ 发送取消通知消息
+```
+
+### 4.4 三种机制与工作流步骤的交互矩阵
+
+| 机制 | 触发方式 | 与运行中步骤的交互 | 效果 |
+|-----|---------|-----------------|------|
+| **取消 (Terminate)** | `client.getHandle().terminate()` | 立即终止，不等待当前步骤 | 工作流完全停止，无清理 |
+| **取消 (软取消)** | 工作空间状态检查 | 长时运行节点结束后检查 | 优雅退出，当前节点完成 |
+| **取消 (活动级)** | 旅程状态检查 | 活动执行时检查 | 返回 `JourneyEarlyExit`，工作流决定 |
+| **跳过 (skipOnFailure)** | 消息发送失败后 | 工作流决策层 | 失败节点跳过，继续下一节点 |
+| **跳过 (订阅状态)** | 订阅检查 | 消息发送前检查 | `MessageSkipped`，工作流决定 |
+| **跳过 (缺少标识符)** | 标识符检查 | 消息发送前检查 | `MessageSkipped`，工作流决定 |
+| **重发 (Temporal 重试)** | 活动失败抛出 | 活动层重试 | 对工作流透明，同一次活动调用 |
+| **重发 (Signal 追加)** | 新事件 signal | 工作流内部状态更新 | 追加事件，等待节点重新评估 |
+
+---
+
+## 5. 外部 Signal 与工作流步骤的互动详解
+
+### 5.1 Signal 定义概览
 
 Dittofeed 的 UserJourneyWorkflow 定义了三种信号：
 
@@ -426,11 +835,13 @@ export const reEvaluateSegmentsSignal =
 export const trackSignal = wf.defineSignal<[TrackSignalParams]>("track");
 ```
 
-### 4.2 信号处理机制
+### 5.2 三种 Signal 与工作流步骤的互动
 
-#### 4.2.1 trackSignal - 键控事件信号
+#### 5.2.1 trackSignal - 键控事件信号
 
-**用途**: 向已运行的键控工作流发送额外事件
+**用途**: 向已运行的键控工作流发送额外事件（如订单更新、预约取消等）
+
+**与工作流步骤的互动**:
 
 ```typescript
 // packages/backend-lib/src/journeys/userWorkflow.ts:444-527
@@ -484,21 +895,25 @@ wf.setHandler(trackSignal, async (event) => {
 });
 ```
 
-**与工作流步骤的互动**:
+**交互场景**:
 
 1. **WaitForNode 中**: 
    - `waitForSegmentIds` 不为 null
    - 信号触发后立即重新评估所有等待中的 segment
    - 如果满足条件，`wf.condition` 会被唤醒
 
-2. **其他节点中**:
+2. **DelayNode 中**:
    - 事件被加入 `keyedEvents` / `keyedEventIds`
-   - 不立即影响当前执行
-   - 等待下一个需要 segment 评估的节点
+   - 不立即影响当前睡眠
+   - 等待 DelayNode 结束后，后续节点使用新事件
 
-#### 4.2.2 segmentUpdateSignal - Segment 变更通知
+3. **MessageNode 中**:
+   - 事件被加入 `keyedEvents`
+   - 消息发送可能使用新事件的属性
 
-**用途**: 外部系统通知 segment 分配状态变更
+#### 5.2.2 segmentUpdateSignal - Segment 变更通知
+
+**用途**: 外部系统通知 segment 分配状态变更（如计算属性工作流检测到 segment 变化）
 
 ```typescript
 // packages/backend-lib/src/journeys/userWorkflow.ts:529-549
@@ -561,9 +976,9 @@ wf.setHandler(segmentUpdateSignal, (update) => {
    - 任何一个 segment 变为 true 都会唤醒
    - 超时后走 timeout 分支
 
-#### 4.2.3 reEvaluateSegmentsSignal - 强制重新评估
+#### 5.2.3 reEvaluateSegmentsSignal - 强制重新评估
 
-**用途**: 强制工作流重新从数据库查询 segment 状态
+**用途**: 强制工作流重新从数据库查询 segment 状态（不依赖 segment 变更事件）
 
 ```typescript
 // packages/backend-lib/src/journeys/userWorkflow.ts:551-599
@@ -604,9 +1019,9 @@ wf.setHandler(reEvaluateSegmentsSignal, async (params) => {
 - 需要立即同步最新状态
 - 不依赖 segment 变更事件
 
-### 4.3 Signal 发送方式
+### 5.3 Signal 发送方式
 
-#### 4.3.1 SignalWithStart (原子操作)
+#### 5.3.1 SignalWithStart (原子操作)
 
 ```typescript
 // packages/backend-lib/src/journeys/userWorkflow/lifecycle.ts:70-95
@@ -643,10 +1058,10 @@ await workflowClient.signalWithStart<
 - 避免竞态条件
 - 配合 `WorkflowExecutionAlreadyStartedError` 实现幂等
 
-#### 4.3.2 单独发送 Signal
+#### 5.3.2 单独发送 Signal
 
 ```typescript
-// 测试示例
+// 测试示例: 向已存在的工作流发送取消事件
 await handle1.signal(trackSignal, {
   version: TrackSignalParamsVersion.V2,
   messageId: cancelledEvent.messageId,
@@ -655,9 +1070,9 @@ await handle1.signal(trackSignal, {
 
 用于向已存在的工作流发送信号。
 
-### 4.4 长时运行节点的信号交互
+### 5.4 长时运行节点的详细交互
 
-#### 4.4.1 长时运行节点类型
+#### 5.4.1 长时运行节点类型
 
 ```typescript
 // packages/backend-lib/src/journeys/userWorkflow.ts:200-204
@@ -668,103 +1083,182 @@ const LONG_RUNNING_NODE_TYPES = new Set<JourneyNodeType>([
 ]);
 ```
 
-#### 4.4.2 工作区状态检查
+#### 5.4.2 不同长时运行节点的 Signal 响应
 
-```typescript
-// packages/backend-lib/src/journeys/userWorkflow.ts:1100-1111
-// check if workspace is inactive after a long running node
-if (LONG_RUNNING_NODE_TYPES.has(currentNode.type)) {
-  const workspace = await getWorkspace(workspaceId);
-  if (workspace?.status !== "Active") {
-    logger.info("workspace is not active, exiting journey", {
-      workspaceId,
-      userId,
-      journeyId,
-    });
-    break;
-  }
-}
+| 节点类型 | 当前状态 | 收到 Signal 后的行为 |
+|---------|---------|-------------------|
+| **WaitForNode** | `wf.condition()` 等待中 | 立即重新评估 segment，可能唤醒工作流 |
+| **DelayNode** | `await sleep()` 睡眠中 | Signal Handler 执行（更新状态），但不打断睡眠 |
+| **SegmentEntryNode** | `wf.condition()` 等待中 | 检查 segment 条件，满足则唤醒 |
+
+**DelayNode 中的 Signal 处理**:
 ```
+工作流正在执行 DelayNode: await sleep(1小时)
 
-长时运行节点结束后，会检查工作空间状态：
-- 如果工作空间不再 Active，立即退出旅程
-- 用于处理工作空间被禁用/删除的情况
+时间线:
+0:00   工作流进入 DelayNode，开始 sleep
+0:30   收到 trackSignal (新事件到达)
+       └─▶ Signal Handler 执行
+       └─▶ 事件追加到 keyedEvents
+       └─▶ 如果有 waitForSegmentIds，重新评估 segment
+       └─▶ 但 sleep 仍在继续...
+1:00   sleep 结束
+       └─▶ 工作流继续执行后续节点
+       └─▶ 后续节点可以访问新事件
+```
 
 ---
 
-## 5. 三者协同机制总结
+## 6. 三者协同机制总结
 
-### 5.1 协同流程图
+### 6.1 协同流程图
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    外部事件 / Signal 入口                         │
-└──────────────────────┬──────────────────────────────────────────┘
-                       │
-                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  1. 幂等性检查层 (Idempotency Layer)                              │
-│     ┌─────────────────────────────────────────────────────┐     │
-│     │ 工作流 ID 生成 (uuidV5 + 业务键)                      │     │
-│     │ signalWithStart + WorkflowExecutionAlreadyStarted   │     │
-│     │ isRunnable 数据库检查                                 │     │
-│     └─────────────────────────────────────────────────────┘     │
-└──────────────────────┬──────────────────────────────────────────┘
-                       │ 检查通过
-                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  2. 工作流执行层 (Workflow Execution)                             │
-│     ┌─────────────────────────────────────────────────────┐     │
-│     │ 节点循环 (nodeLoop)                                  │     │
-│     │ - SegmentEntryNode: 等待 segment 条件               │     │
-│     │ - DelayNode: 睡眠等待                                │     │
-│     │ - WaitForNode: 多条件等待 + 超时                     │     │
-│     │ - MessageNode: 消息发送 + 重试                      │     │
-│     └─────────────────────────────────────────────────────┘     │
-└──────────────────────┬──────────────────────────────────────────┘
-                       │ Signal 到达
-                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  3. Signal 处理层 (Signal Handlers)                              │
-│     ┌─────────────┬──────────────┬─────────────────────┐        │
-│     │ trackSignal │segmentUpdate │ reEvaluateSegments  │        │
-│     │ 事件追加    │ 版本控制更新  │ 强制重新评估         │        │
-│     └──────┬──────┴──────┬───────┴──────────┬──────────┘        │
-│            │             │                  │                   │
-│            ▼             ▼                  ▼                   │
-│     ┌─────────────────────────────────────────────────┐        │
-│     │ 更新 segmentAssignments / keyedEvents           │        │
-│     │ 触发 wf.condition 唤醒 (如果在等待节点)          │        │
-│     └─────────────────────────────────────────────────┘        │
-└──────────────────────┬──────────────────────────────────────────┘
-                       │ 活动调用
-                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  4. 活动重试层 (Activity Retry)                                  │
-│     ┌─────────────────────────────────────────────────────┐     │
-│     │ Temporal 重试 (maximumAttempts)                     │     │
-│     │ - 默认重试 (defaultUserJourneyMaxAttempts)          │     │
-│     │ - 节点配置 (MessageNode.retryCount)                 │     │
-│     │ - 心跳超时 (waitForComputeProperties)               │     │
-│     ├─────────────────────────────────────────────────────┤     │
-│     │ 应用级重试 (p-retry)                                │     │
-│     │ - getEventsByIdWithRetry (ClickHouse 延迟)          │     │
-│     └─────────────────────────────────────────────────────┘     │
-└──────────────────────┬──────────────────────────────────────────┘
-                       │ 失败处理
-                       ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  5. 失败决策层 (Failure Decision)                                │
-│     ┌─────────────────────────────────────────────────────┐     │
-│     │ skipOnFailure: true  → 继续下一节点                  │     │
-│     │ skipOnFailure: false → 退出节点                      │     │
-│     │ canRunMultiple: true  → continueAsNew 重复进入       │     │
-│     │ canRunMultiple: false → 永久结束                     │     │
-│     └─────────────────────────────────────────────────────┘     │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          外部事件 / Signal 入口                               │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  1. 幂等性检查层 (Idempotency Layer)                                          │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 工作流 ID 生成 (uuidV5 + 业务键)                                      │   │
+│  │ - 普通: user-journey-{userId}-{journeyId}                            │   │
+│  │ - 键控: user-journey-keyed-{...uuidV5(userId, eventKey, value)...}   │   │
+│  │                                                                     │   │
+│  │ signalWithStart + WorkflowExecutionAlreadyStartedError               │   │
+│  │ - 第一次: 创建工作流 + 发送 signal                                    │   │
+│  │ - 重复: 捕获异常，静默忽略                                            │   │
+│  │                                                                     │   │
+│  │ isRunnable 数据库检查                                                │   │
+│  │ - 查询 userJourneyEvent 历史记录                                     │   │
+│  │ - canRunMultiple: false → 直接退出                                   │   │
+│  │                                                                     │   │
+│  │ 运行时 Signal 去重 (keyedEventIds Set)                               │   │
+│  │ - 相同 messageId 的 signal 被忽略                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │ 检查通过
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  2. 工作流执行层 (Workflow Execution)                                         │
+│                                                                             │
+│  nodeLoop 循环执行节点:                                                      │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐       │
+│  │SegmentEntry │  │  DelayNode  │  │ WaitForNode │  │MessageNode  │       │
+│  │    Node     │  │             │  │             │  │             │       │
+│  │等待 segment │  │  sleep()    │  │多条件等待   │  │消息发送     │       │
+│  │ wf.condition│  │             │  │+超时       │  │+重试        │       │
+│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘       │
+│         │                │                │                │                │
+│         ▼                ▼                ▼                ▼                │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │              活动调用 (Activity Invocation)                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │ Signal 随时可以到达
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  3. Signal 处理层 (Signal Handlers)                                          │
+│                                                                             │
+│  ┌──────────────────┐ ┌──────────────────┐ ┌─────────────────────┐         │
+│  │   trackSignal    │ │segmentUpdateSignal│ │ reEvaluateSegments  │         │
+│  │                  │ │                  │ │                     │         │
+│  │ 事件追加         │ │ 版本控制更新      │ │ 强制重新查询数据库   │         │
+│  │ keyedEvents     │ │ segmentVersion   │ │ getSegmentAssignment │         │
+│  │ keyedEventIds   │ │                  │ │                     │         │
+│  └────────┬─────────┘ └────────┬─────────┘ └──────────┬──────────┘         │
+│           │                   │                      │                      │
+│           ▼                   ▼                      ▼                      │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 更新 segmentAssignments / keyedEvents                               │   │
+│  │                                                                     │   │
+│  │ 如果在等待节点 (WaitFor / SegmentEntry):                            │   │
+│  │ └─▶ wf.condition() 检测条件变化 → 唤醒工作流                         │   │
+│  │                                                                     │   │
+│  │ 如果在非等待节点 (Delay / Message):                                 │   │
+│  │ └─▶ 状态更新，但不打断当前执行                                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │ 活动失败
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  4. 重试层 (Retry Layer)                                                     │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Temporal 活动重试                                                   │   │
+│  │ - maximumAttempts (节点级配置或默认值)                              │   │
+│  │ - 指数退避                                                          │   │
+│  │ - 心跳超时检测 (waitForComputeProperties)                           │   │
+│  │                                                                     │   │
+│  │ 非最后一次失败 → 抛出异常 → Temporal 自动重试                        │   │
+│  │                                                                     │   │
+│  │ 最后一次失败 → 返回 JourneyEarlyExit → 工作流决策                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 应用级重试 (p-retry) - getEventsByIdWithRetry                      │   │
+│  │ - 10次重试，50ms-1000ms 指数退避                                    │   │
+│  │ - 最大 60秒总等待                                                   │   │
+│  │ - 处理 ClickHouse 写入延迟                                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└──────────────────────────────┬──────────────────────────────────────────────┘
+                               │ 重试耗尽或跳过
+                               ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  5. 决策层 (Decision Layer) - 取消 / 跳过                                    │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 消息发送失败决策                                                     │   │
+│  │                                                                     │   │
+│  │ JourneyEarlyExit 到达时:                                            │   │
+│  │ ┌─────────────────────────────────────────────────────────────┐   │   │
+│  │ │ skipOnFailure ?                                              │   │   │
+│  │ ├── true  ──▶ 跳过失败，继续下一节点 (nextNode = child)         │   │   │
+│  │ └── false ──▶ 取消旅程，退出    (nextNode = exitNode, break)   │   │   │
+│  │ └─────────────────────────────────────────────────────────────┘   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 消息跳过决策 (MessageSkipped)                                        │   │
+│  │                                                                     │   │
+│  │ SubscriptionState:                                                  │   │
+│  │ - 用户取消订阅 → MessageSkipped → 工作流决定                        │   │
+│  │                                                                     │   │
+│  │ MissingIdentifier:                                                  │   │
+│  │ - 缺少 email/phone → MessageSkipped → 工作流决定                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 工作流取消 (Termination)                                             │   │
+│  │                                                                     │   │
+│  │ 硬取消:                                                             │   │
+│  │ - client.getHandle().terminate()                                    │   │
+│  │ - 立即停止，不等待当前活动                                           │   │
+│  │                                                                     │   │
+│  │ 软取消:                                                             │   │
+│  │ - 长时运行节点后检查 workspace.status                                │   │
+│  │ - 非 Active 时 break 退出                                           │   │
+│  │ - 当前节点完成，优雅退出                                             │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 工作流重复进入 (ContinueAsNew)                                       │   │
+│  │                                                                     │   │
+│  │ shouldReEnter() 检查:                                               │   │
+│  │ - journey.canRunMultiple === true                                   │   │
+│  │ - 仍有新事件等待处理                                                │   │
+│  │                                                                     │   │
+│  │ continueAsNew<typeof userJourneyWorkflow>(props)                    │   │
+│  │ - 保持相同 Workflow ID                                              │   │
+│  │ - 重置工作流历史，避免无限增长                                       │   │
+│  │ - 保持幂等性                                                        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 典型场景分析
+### 6.2 典型场景分析
 
 #### 场景一: 重复订单事件 (幂等性)
 
@@ -777,89 +1271,172 @@ if (LONG_RUNNING_NODE_TYPES.has(currentNode.type)) {
    - `keyedEventIds.add("message-id-001")`
    - 再次收到相同 signal → `keyedEventIds.has()` → 忽略
 
-#### 场景二: 消息发送失败重试
+#### 场景二: 消息发送失败 → 重试 → 跳过/取消
 
-1. **节点**: MessageNode 发送邮件
-2. **Temporal 重试**:
-   - 配置: `maximumAttempts: 3`
-   - 失败 1, 2 次 → Temporal 自动重试
-   - 失败第 3 次 (last attempt) → 活动返回 `JourneyEarlyExit`
-3. **决策**:
-   - `skipOnFailure: true` → 继续下一个节点
-   - `skipOnFailure: false` → 跳转到 ExitNode
+1. **节点**: MessageNode 发送邮件，配置 `retryCount: 3`，`skipOnFailure: true`
+2. **第 1 次发送失败**:
+   - 活动抛出异常
+   - Temporal 自动重试（指数退避）
+3. **第 2 次发送失败**:
+   - 活动抛出异常
+   - Temporal 自动重试
+4. **第 3 次发送失败 (last attempt)**:
+   - 活动不抛出异常，返回 `JourneyEarlyExit`
+   - 工作流检查 `skipOnFailure: true`
+   - 跳过失败，继续执行下一个节点
 
-#### 场景三: WaitFor 节点 + Segment Signal
+**如果 skipOnFailure: false**:
+   - 工作流设置 `nextNode = definition.exitNode`
+   - `break nodeLoop`，取消旅程
 
-1. **工作流状态**: 在 WaitForNode 等待用户进入 "paid" segment
-2. **外部变更**: 用户升级为付费用户
+#### 场景三: 预约取消事件 (Signal + WaitForNode)
+
+1. **工作流状态**: 在 WaitForNode 等待用户进入 "appointment_cancelled" segment
+   - 配置: 当 `APPOINTMENT_UPDATE` 事件 `operation: "CANCELLED"` 时，segment 变为 true
+
+2. **取消事件到达**:
+   - 事件: `{event: "APPOINTMENT_UPDATE", properties: {appointmentId: "APT001", operation: "CANCELLED"}}`
+   - `getKeyedUserJourneyWorkflowId` 生成相同的工作流 ID（基于 `appointmentId`）
+
 3. **Signal 发送**:
-   - `segmentUpdateSignal` 到达: `{segmentId: "paid", currentlyInSegment: true, segmentVersion: 12345}`
-4. **Signal 处理**:
-   - `segmentAssignments.set("paid", {currentlyInSegment: true, segmentVersion: 12345})`
-5. **工作流唤醒**:
-   - `wf.condition(() => segmentChildren.some((s) => segmentAssignedTrue(s.segmentId)))` 返回 true
-   - 工作流继续执行对应分支
+   - 捕获 `WorkflowExecutionAlreadyStartedError`
+   - 或者单独调用 `handle.signal(trackSignal, {...})`
 
-#### 场景四: 工作流 ContinueAsNew (循环旅程)
+4. **Signal Handler 执行**:
+   - 去重检查通过（新的 messageId）
+   - 事件追加到 `keyedEvents`
+   - `waitForSegmentIds` 不为 null（正在等待）
+   - 调用 `getSegmentAssignmentHandler` 重新评估
+   - 新事件使 segment 变为 true
+
+5. **工作流唤醒**:
+   - `wf.condition(() => segmentAssignedTrue(cancelledSegmentId))` 返回 true
+   - 工作流继续执行取消分支
+   - 发送取消通知邮件
+
+#### 场景四: 用户取消订阅 (MessageSkipped)
+
+1. **工作流状态**: 执行到 MessageNode 准备发送邮件
+2. **订阅检查**:
+   ```typescript
+   // packages/backend-lib/src/messaging.ts:422-435
+   if (subscriptionGroupDetails && !inSubscriptionGroup(subscriptionGroupDetails)) {
+     return err({
+       type: InternalEventType.MessageSkipped,
+       variant: {
+         type: MessageSkippedType.SubscriptionState,
+         action: SubscriptionChange.Unsubscribe,
+         ...
+       },
+     });
+   }
+   ```
+3. **消息跳过**:
+   - 活动返回 `MessageSkipped` 错误
+   - `sendMessageV2` 返回 `false`（消息未成功发送）
+4. **工作流决策**:
+   - 检查 `skipOnFailure`
+   - 如果 `true`: 继续下一个节点
+   - 如果 `false`: 取消旅程
+
+#### 场景五: 工作流 ContinueAsNew (循环旅程)
 
 1. **旅程配置**: `canRunMultiple: true`
-2. **工作流结束**: 执行完所有节点
-3. **检查**:
+2. **工作流结束**: 执行完所有节点，到达 ExitNode
+3. **重复进入检查**:
    ```typescript
+   // packages/backend-lib/src/journeys/userWorkflow/activities.ts:777-810
+   export async function shouldReEnter({
+     journeyId,
+     userId,
+     workspaceId,
+   }): Promise<boolean> {
+     const journey = await db().query.journey.findFirst({...});
+     if (!journey || !journey.canRunMultiple) {
+       return false;
+     }
+     // 检查是否有新事件等待处理
+     // ...
+     return true;
+   }
+   ```
+4. **ContinueAsNew**:
+   ```typescript
+   // packages/backend-lib/src/journeys/userWorkflow.ts:1127-1133
    if (await shouldReEnter({ journeyId, userId, workspaceId })) {
      if (shouldContinueAsNew) {
        await continueAsNew<typeof userJourneyWorkflow>(props);
+     } else {
+       return props;
      }
    }
    ```
-4. **结果**:
+5. **结果**:
    - 创建新的工作流 Run（保持相同的 Workflow ID）
    - 重置工作流历史，避免历史无限增长
    - 保持幂等性（同一时间只有一个运行实例）
 
 ---
 
-## 6. 关键文件位置
+## 7. 关键文件位置
 
 | 功能 | 文件路径 | 关键函数/配置 |
 |-----|---------|-------------|
 | 工作流定义 | `packages/backend-lib/src/journeys/userWorkflow.ts` | `userJourneyWorkflow`, `getKeyedUserJourneyWorkflowId` |
 | Signal 定义 | `packages/backend-lib/src/journeys/userWorkflow.ts` | `trackSignal`, `segmentUpdateSignal`, `reEvaluateSegmentsSignal` |
 | 工作流生命周期 | `packages/backend-lib/src/journeys/userWorkflow/lifecycle.ts` | `startKeyedUserJourney`, `signalWithStart` |
-| 活动实现 | `packages/backend-lib/src/journeys/userWorkflow/activities.ts` | `isRunnable`, `shouldReEnter`, `sendMessageV2` |
+| 活动实现 | `packages/backend-lib/src/journeys/userWorkflow/activities.ts` | `isRunnable`, `shouldReEnter`, `sendMessageV2`, `getEventsByIdWithRetry` |
+| 跳过类型定义 | `packages/isomorphic-lib/src/types.ts` | `MessageSkippedType`, `NonRetryableMessageSendFailure` |
+| 消息跳过逻辑 | `packages/backend-lib/src/messaging.ts` | `sendMessage` 中的订阅检查、标识符检查 |
 | 配置 | `packages/backend-lib/src/config.ts` | `defaultUserJourneyMaxAttempts`, `waitForComputePropertiesMaxAttempts` |
-| 应用级重试 | `packages/backend-lib/src/journeys/userWorkflow/activities.ts` | `getEventsByIdWithRetry` |
+| 工作流终止 | `packages/backend-lib/src/computedProperties/computePropertiesWorkflow/lifecycle.ts` | `terminateComputePropertiesWorkflow`, `resetComputePropertiesWorkflow` |
 | 工作流入站拦截器 | `packages/backend-lib/src/temporal/workflowInboundCallsInterceptor.ts` | `DittofeedWorkflowInboundInterceptor` |
 | 重试工具函数 | `packages/backend-lib/src/retry.ts` | `retryExponential` |
-| 测试 | `packages/backend-lib/src/journeys/keyedEventEntry.test.ts` | 键控事件测试 |
-| 测试 | `packages/backend-lib/src/journeys/reEnter.test.ts` | 重复进入测试 |
+| 测试 (键控事件) | `packages/backend-lib/src/journeys/keyedEventEntry.test.ts` | 预约取消场景、Signal 追加测试 |
+| 测试 (重复进入) | `packages/backend-lib/src/journeys/reEnter.test.ts` | continueAsNew 测试 |
 
 ---
 
-## 7. 总结
+## 8. 总结
 
-Dittofeed 的 Journey 工作流通过三层机制保证可靠性：
+Dittofeed 的 Journey 工作流通过三层机制保证可靠性，并实现了取消、跳过、重发与工作流步骤的精确协同：
 
-1. **幂等性**:
-   - 工作流 ID = 业务键的 UUID v5 哈希
-   - `signalWithStart` + `WorkflowExecutionAlreadyStartedError`
-   - `isRunnable` 数据库检查
-   - `keyedEventIds` 去重
+### 8.1 幂等性机制
 
-2. **重试策略**:
-   - Temporal SDK 重试（可配置的 `maximumAttempts`）
-   - 节点级配置（MessageNode.retryCount）
-   - 应用级重试（p-retry 处理 ClickHouse 延迟）
-   - 心跳超时检测
+- **工作流 ID 生成**: 业务键的 UUID v5 哈希（`workspaceId` + `userId` + `journeyId` + `eventKey` + `eventKeyValue`）
+- **入口幂等**: `signalWithStart` + `WorkflowExecutionAlreadyStartedError`
+- **历史检查**: `isRunnable` 数据库查询，支持 `canRunMultiple` 配置
+- **运行时去重**: `keyedEventIds` Set 防止重复 Signal
 
-3. **Signal 互动**:
-   - `trackSignal`: 追加事件，支持 WaitFor 节点实时评估
-   - `segmentUpdateSignal`: 版本控制的 segment 变更通知
-   - `reEvaluateSegmentsSignal`: 强制重新查询数据库
-   - 通过 `segmentAssignments` + `wf.condition` 实现等待节点的唤醒
+### 8.2 重试策略
+
+- **Temporal 活动重试**: 可配置 `maximumAttempts`，指数退避
+- **节点级配置**: `MessageNode.retryCount` 覆盖默认值
+- **应用级重试**: `p-retry` 处理 ClickHouse 写入延迟（10次，50ms-1000ms）
+- **最后一次尝试**: 返回 `JourneyEarlyExit` 而非抛出，让工作流决策
+
+### 8.3 取消、跳过、重发与工作流步骤的协同
+
+**取消 (Cancellation)**:
+- **硬取消**: `client.getHandle().terminate()` 立即终止
+- **软取消**: 长时运行节点后检查 `workspace.status`，优雅退出
+- **活动级取消**: 旅程状态检查，返回 `JourneyEarlyExit`
+
+**跳过 (Skip)**:
+- **skipOnFailure**: 消息重试耗尽后，工作流决定跳过或取消
+- **MessageSkipped.SubscriptionState**: 用户取消订阅时跳过
+- **MessageSkipped.MissingIdentifier**: 缺少标识符时跳过
+
+**重发 (Retry/Resend)**:
+- **Temporal 重试**: 活动层透明重试，对工作流无感知
+- **Signal 追加**: 新事件通过 `trackSignal` 追加到已运行工作流
+- **WaitFor 节点响应**: Signal 触发 segment 重新评估，可能唤醒工作流
+
+### 8.4 协同保证
 
 这三个机制协同工作，确保：
-- **一致性**: 相同事件只处理一次
-- **可靠性**: 失败时自动重试
-- **响应性**: 外部变更能实时影响工作流执行
-- **可观测性**: 完整的日志和错误追踪
+- **一致性**: 相同事件只处理一次（幂等键 + 去重）
+- **可靠性**: 失败时自动重试（Temporal + 应用级）
+- **可控性**: 失败后可选择跳过或取消（`skipOnFailure`）
+- **响应性**: 外部事件通过 Signal 实时影响工作流（`trackSignal` + `wf.condition`）
+- **可观测性**: 完整的日志和事件追踪（`onNodeProcessedV2`, `InternalEventType`）
