@@ -330,7 +330,152 @@ if (messageTemplateDefinition.emailContentsType === EmailContentsType.LowCode) {
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2.1 每层调用链的代码位置证明
+### 3.2.1 两条并行发送路径：Journey vs Broadcast
+
+Dittofeed 有两条主要的消息发送路径，它们在模板选择和 language 参与上有**完全相同的缺口**：
+
+#### 3.2.1.1 Journey 路径（已分析）
+
+```
+Journey MessageNode 定义 (types.ts:1167)
+    ↓
+User Workflow MessageNode 处理 (userWorkflow.ts:852-961)
+    ↓
+sendMessageV2 (userWorkflow/activities.ts:394)
+    ↓
+sendMessageInner (userWorkflow/activities.ts:174-301)
+    ↓
+sendMessage() 分发 (messaging.ts:2410-2418)
+    ↓
+各渠道发送 (sendEmail/sendSms/sendWebhook)
+    ↓
+getSendMessageModels → findMessageTemplate → renderValues → renderLiquid
+```
+
+#### 3.2.1.2 Broadcast 路径（新增分析）
+
+**完整调用链**：
+
+```
+Broadcast 配置定义 (types.ts:5994-6008)
+    ├── BroadcastV2Config.message: Type.Union([
+    │   │   BroadcastEmailMessageVariant,    // 仅 Email
+    │   │   BroadcastSmsMessageVariant,      // 仅 SMS
+    │   │   Type.Omit(WebhookMessageVariant, ["templateId"])  // 仅 Webhook
+    │   │   // ❌ 无 ChannelType.MobilePush！
+    │   ])
+    │
+    └── ↓
+
+broadcastWorkflowV2 (broadcastWorkflowV2.ts:53-250)
+    ├── getBroadcast({ workspaceId, broadcastId })
+    ├── 从 broadcast.messageTemplateId 提取固定模板 ID
+    ├── 计算时区 (computeTimezones/getZonedTimestamp)
+    ├── 动态 schedule 批处理
+    └── 调用 Activity: sendMessages
+
+    ↓
+
+sendMessagesFactory → sendMessagesWithSender (broadcasts/activities.ts:192-431)
+    ├── getBroadcast({ workspaceId, broadcastId })
+    ├── getUnmessagedUsers(segment, subscriptionGroup)  ← 获取用户列表
+    ├── getSubscriptionGroupsWithAssignments()
+    ├── 遍历每个用户:
+    │   ├── 构造 userPropertyAssignments (包含 language)
+    │   ├── switch (config.message.type):
+    │   │   ├── Email → messageVariant = { ...baseParams, channel: Email }
+    │   │   ├── SMS → messageVariant = { ...baseParams, channel: Sms }
+    │   │   ├── Webhook → messageVariant = { ...baseParams, channel: Webhook }
+    │   │   // ❌ 无 MobilePush case！
+    │   ├── ❌ 不读取 userPropertyAssignments["language"]
+    │   ├── ❌ templateId = broadcast.messageTemplateId (固定值)
+    │   └── 调用 sender(messageVariant) → sendMessage()
+    └── submitBatch(events)
+
+    ↓
+
+sendMessage() 分发 (messaging.ts:2410-2418)
+    └── 与 Journey 路径完全相同:
+        ├── getSendMessageModels({ templateId, channel, ... })
+        ├── findMessageTemplate({ id: templateId, channel })
+        ├── renderValues() → renderLiquid()
+        └── ❌ language 未参与模板选择
+```
+
+**BroadcastV2Config 关键证据**（`types.ts:6002-6007`）：
+```typescript
+message: Type.Union([
+  BroadcastEmailMessageVariant,      // type: "Email"
+  BroadcastSmsMessageVariant,        // type: "Sms"
+  Type.Omit(WebhookMessageVariant, ["templateId"]),  // type: "Webhook"
+  // ❌ 无 ChannelType.MobilePush
+])
+```
+
+**sendMessagesFactory 中的 switch 证据**（`broadcasts/activities.ts:336-358`）：
+```typescript
+switch (config.message.type) {
+  case ChannelType.Email:
+    messageVariant = {
+      ...baseParams,
+      ...config.message,
+      channel: ChannelType.Email,
+    };
+    break;
+  case ChannelType.Sms:
+    messageVariant = {
+      ...baseParams,
+      ...config.message,
+      channel: ChannelType.Sms,
+    };
+    break;
+  case ChannelType.Webhook:
+    messageVariant = {
+      ...baseParams,
+      ...config.message,
+      channel: ChannelType.Webhook,
+    };
+    break;
+  // ❌ 无 default: assertUnreachable(config.message)
+  // ❌ 无 ChannelType.MobilePush case
+}
+```
+
+**templateId 固定证据**（`broadcasts/activities.ts:329`）：
+```typescript
+const baseParams: SendMessageParametersBase = {
+  userId: user.id,
+  workspaceId: params.workspaceId,
+  templateId: messageTemplateId,   // ← 来自 broadcast.messageTemplateId
+  useDraft: false,
+  userPropertyAssignments,
+  // ...
+};
+```
+
+#### 3.2.1.3 Journey vs Broadcast：共同缺口对比
+
+| 检查点 | Journey 路径 | Broadcast 路径 | 共同缺口 |
+|--------|-------------|----------------|---------|
+| 模板定义类型 | `MessageNode.variant.templateId` (固定字符串) | `broadcast.messageTemplateId` (固定字符串) | ❌ 都是固定 ID，无 templateGroup 概念 |
+| 参数类型 | `SendMessageParameters` 无 language 字段 | 相同 | ❌ 没有 language 参数 |
+| 用户属性获取 | `findAllUserPropertyAssignments()` | 遍历 `user.properties` 构造 `userPropertyAssignments` | ✅ 都能获取到 user.language（如果存在） |
+| language 读取 | ❌ 从未读取用于模板选择 | ❌ 从未读取用于模板选择 | ❌ 相同 |
+| findMessageTemplate | 仅按 `id` 查询 | 仅按 `id` 查询 | ❌ 相同 |
+| 版本选择 | `useDraft ? draft : definition` | `useDraft: false` (固定)，只用 definition | ❌ 相同，都无语言版本 |
+| 数据模型 | MessageTemplate 表无 language 列 | 相同 | ❌ 相同 |
+| 支持渠道 | Email, SMS, MobilePush, Webhook | Email, SMS, Webhook | ❌ Broadcast 显式不支持 MobilePush |
+| getSendMessageModels | 调用 | 相同调用 | ❌ 都无语言选择 |
+| renderLiquid | `user.language` 注入到上下文 | 相同 | ✅ 相同，但仅用于模板内条件判断 |
+
+**核心结论**：
+- Journey 和 Broadcast **在所有 language 参与模板选择的检查点上都有相同的缺口**
+- 两条路径都可以获取到 `userPropertyAssignments`（包含 `language`），但**从未使用它进行任何模板选择决策**
+- Broadcast 在类型级别就**排除了 MobilePush**（`BroadcastV2Config.message` Union 不包含 MobilePush 变体）
+
+---
+
+### 3.2.2 每层调用链的代码位置证明
 
 #### 第 1 层：Journey MessageNode 定义
 
@@ -1001,9 +1146,14 @@ case ChannelType.Sms: {
 | `packages/backend-lib/src/messaging.ts` | 消息发送流程、模板选择、多字段渲染、校验逻辑 |
 | `packages/backend-lib/src/messaging/sms.ts` | SMS 提供商配置管理 |
 | `packages/backend-lib/src/messaging/email.ts` | 邮件相关工具（退订头等） |
+| `packages/backend-lib/src/journeys/userWorkflow.ts` | User Temporal Workflow，MessageNode 处理入口 |
+| `packages/backend-lib/src/journeys/userWorkflow/activities.ts` | Workflow Activities，sendMessageV2/sendMessageInner |
+| `packages/backend-lib/src/destinations/fcm.ts` | Firebase Cloud Messaging 发送基础设施 |
+| `packages/backend-lib/src/mobilePushTemplates.ts` | Mobile Push 模板列表查询（按 channel 过滤） |
 | `packages/api/src/controllers/contentController.ts` | 模板 API 端点（渲染、保存、测试发送） |
-| `packages/isomorphic-lib/src/types.ts` | 模板类型定义、错误类型、Schema 定义 |
+| `packages/isomorphic-lib/src/types.ts` | 模板类型定义、错误类型、Schema、MessageNode |
 | `packages/isomorphic-lib/src/messageTemplates.ts` | Draft/Definition 转换工具 |
+| `packages/isomorphic-lib/src/channels.ts` | 各渠道标识符键映射 |
 | `packages/emailo/src/toMjml.ts` | Low Code 编辑器 JSON 到 MJML 的转换 |
 | `packages/backend-lib/src/bootstrap.ts` | 默认用户属性定义（包括 language） |
 | `packages/backend-lib/src/config.ts` | 配置项定义（包括 defaultLanguageUserPropertyId） |
