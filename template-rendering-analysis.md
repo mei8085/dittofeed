@@ -249,11 +249,451 @@ if (messageTemplateDefinition.emailContentsType === EmailContentsType.LowCode) {
 | 基于语言的模板选择 | ❌ 未实现 | - |
 | 多语言版本 fallback | ❌ 未实现 | - |
 
-### 3.2 现有的 Fallback 机制
+### 3.2 完整调用链分析：为何多语言无法工作
+
+以下是从 Journey 消息节点到最终渲染的 **完整 12 层调用链**，**每层都用代码位置证明 `language` 完全未参与模板选择**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              完整调用链总览                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  1. Journey MessageNode 定义 (types.ts:1167-1185)                           │
+│       │                                                                     │
+│       ├── variant.templateId: 固定的模板 ID 字符串                           │
+│       └── ⚠️ 无 language 字段                                               │
+│                                                                             │
+│  2. User Workflow 消息节点处理 (userWorkflow.ts:852-961)                     │
+│       │                                                                     │
+│       ├── 从 currentNode.variant.templateId 提取固定模板 ID                  │
+│       ├── 构造 SendParamsV2 (无 language 参数)                              │
+│       └── 调用 sendMessageV2()                                              │
+│                                                                             │
+│  3. sendMessageV2 入口 (userWorkflow/activities.ts:303-394)                 │
+│       │                                                                     │
+│       ├── sendMessageFactory(sendMessage) 闭包                             │
+│       └── 委托给 sendMessageInner()                                         │
+│                                                                             │
+│  4. sendMessageInner (userWorkflow/activities.ts:174-301)                   │
+│       │                                                                     │
+│       ├── findAllUserPropertyAssignments() ← 这里获取到 user.language       │
+│       ├── userPropertyAssignments 包含 language（如果用户有这个属性）        │
+│       ├── 但**不读取** language 用于任何模板选择决策                         │
+│       └── 调用 sender() → sendMessage()                                     │
+│                                                                             │
+│  5. sendMessage() 分发 (messaging.ts:2399-2420)                             │
+│       │                                                                     │
+│       ├── SendMessageParameters 类型无 language 字段                        │
+│       ├── switch (params.channel) 分发到各渠道函数                           │
+│       └── MobilePush: throw new Error("not implemented")                    │
+│                                                                             │
+│  6. getSendMessageModels() 模板获取 (messaging.ts:401-503)                   │
+│       │                                                                     │
+│       ├── 参数: { workspaceId, templateId, channel, useDraft, ... }         │
+│       ├── 调用 findMessageTemplate({ id: templateId, channel })             │
+│       └── ⚠️ 未传递 userPropertyAssignments 或 language                    │
+│                                                                             │
+│  7. findMessageTemplate() 数据库查询 (messaging.ts:183-205)                  │
+│       │                                                                     │
+│       ├── 签名: function findMessageTemplate({ id, channel })               │
+│       ├── 查询: where: eq(dbMessageTemplate.id, id)                         │
+│       ├── ⚠️ 只有 id 一个查询条件，无 language/locale 过滤                   │
+│       └── 版本验证: definition.type === channel                             │
+│                                                                             │
+│  8. 模板版本选择 (messaging.ts:484-489)                                      │
+│       │                                                                     │
+│       ├── definitionFromDraft = useDraft ? draft : null                     │
+│       ├── finalDef = definitionFromDraft ?? definition ?? null              │
+│       └── ⚠️ 只有 useDraft 标志，无 language 版本选择                        │
+│                                                                             │
+│  9. 渠道特定发送函数 (sendEmail/sendSms/sendWebhook)                         │
+│       │                                                                     │
+│       ├── 接收 userPropertyAssignments 参数                                 │
+│       ├── 调用 renderValues() 渲染各字段                                    │
+│       └── ⚠️ 模板 ID 已固定，language 只用于变量绑定                        │
+│                                                                             │
+│ 10. renderValues() 批量渲染 (messaging.ts:561-596)                          │
+│       │                                                                     │
+│       ├── 遍历 templates 对象（from, subject, body 等）                     │
+│       ├── 对每个字段调用 renderLiquid()                                     │
+│       └── ⚠️ 只是变量绑定，不选择模板版本                                   │
+│                                                                             │
+│ 11. renderLiquid() 核心渲染 (liquid.ts:258-297)                             │
+│       │                                                                     │
+│       ├── 构造 context: { user: userProperties, ... }                      │
+│       ├── user.language 作为普通变量注入 Liquid 上下文                      │
+│       ├── 可用于 {% if user.language == "zh-CN" %} 条件判断                  │
+│       └── ⚠️ 但这是模板内逻辑，不是系统级 fallback                           │
+│                                                                             │
+│ 12. 最终输出                                                                 │
+│       │                                                                     │
+│       └── 返回渲染后的字符串，无语言相关后处理                               │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 3.2.1 每层调用链的代码位置证明
+
+#### 第 1 层：Journey MessageNode 定义
+
+**文件位置**：`packages/isomorphic-lib/src/types.ts:1167-1185`
+
+```typescript
+export const MessageNode = Type.Object({
+  ...BaseNode,
+  type: Type.Literal(JourneyNodeType.MessageNode),
+  name: Type.Optional(Type.String()),
+  subscriptionGroupId: Type.Optional(Type.String()),
+  variant: MessageVariant,      // ← 包含固定 templateId
+  child: Type.String(),
+  syncProperties: Type.Optional(Type.Boolean()),
+  skipOnFailure: Type.Optional(Type.Boolean()),
+  retryCount: Type.Optional(Type.Number({ description: "Number of retry attempts (default: 3)" })),
+});
+```
+
+**MessageVariant**（`types.ts:1054-1163`）：
+```typescript
+export const MobilePushMessageVariant = Type.Object({
+  type: Type.Literal(ChannelType.MobilePush),
+  templateId: Type.String(),           // ← 固定字符串 ID
+  providerOverride: Type.Optional(Type.Enum(MobilePushProviderType)),
+});
+// ⚠️ 无 language 或 locale 字段
+```
+
+**结论**：MessageNode 绑定固定的 `templateId`，没有语言选择的空间。
+
+#### 第 2 层：User Workflow 消息节点处理
+
+**文件位置**：`packages/backend-lib/src/journeys/userWorkflow.ts:852-961`
+
+```typescript
+case JourneyNodeType.MessageNode: {
+  const messageId = uuid4();
+  // ... 触发消息 ID 处理 ...
+
+  const messagePayload: Omit<activities.SendParams, "templateId"> = {
+    userId,
+    workspaceId,
+    journeyId,
+    subscriptionGroupId: currentNode.subscriptionGroupId,
+    runId,
+    nodeId: currentNode.id,
+    messageId,
+    triggeringMessageId,
+    // ⚠️ 无 language 字段
+  };
+
+  let variant: RenameKey<MessageVariant, "type", "channel">;
+  switch (currentNode.variant.type) {
+    case ChannelType.Email:
+    case ChannelType.Sms:
+    case ChannelType.Webhook:
+    case ChannelType.MobilePush:
+      variant = {
+        ...omit(currentNode.variant, ["type"]),
+        channel: currentNode.variant.type,
+        // ⚠️ 直接使用 currentNode.variant.templateId
+        // ⚠️ 没有任何基于用户属性的动态模板选择
+      };
+      break;
+  }
+
+  const sendMesssageParams: SendParamsV2 = {
+    ...messagePayload,
+    ...variant,
+    events: keyedEvents,
+    context: entryEventProperties,
+    isHidden,
+    // ⚠️ 仍无 language 字段
+  };
+
+  const { sendMessageV2 } = proxyActivities<typeof activities>({
+    startToCloseTimeout: "2 minutes",
+    retry: { maximumAttempts: currentNode.retryCount ?? 3 },
+  });
+  const messageSucceeded = await sendMessageV2(sendMesssageParams);
+```
+
+**结论**：直接从 Journey 节点提取 `templateId`，无任何动态选择逻辑。
+
+#### 第 3-4 层：sendMessageV2 → sendMessageInner
+
+**文件位置**：`packages/backend-lib/src/journeys/userWorkflow/activities.ts:303-394`
+
+```typescript
+export function sendMessageFactory(sender: Sender) {
+  return async function sendMessageWithSender(
+    params: SendParamsV2,
+  ): Promise<boolean> {
+    // ... Journey 状态检查 ...
+    const sendResult = await sendMessageInner({
+      ...params,
+      sender,
+    });
+    // ... 事件跟踪 ...
+  };
+}
+
+export const sendMessageV2 = sendMessageFactory(sendMessage);
+```
+
+**sendMessageInner**（`activities.ts:174-301`）：
+```typescript
+async function sendMessageInner({
+  userId,
+  workspaceId,
+  runId,
+  nodeId,
+  templateId,     // ← 来自 params，是固定值
+  journeyId,
+  messageId,
+  subscriptionGroupId,
+  context: deprecatedContext,
+  events,
+  sender,
+  retryCount,
+  ...rest
+}: SendParamsInner): Promise<SendMessageInnerResult> {
+  // ... context 处理 ...
+
+  const [userPropertyAssignments, journey, subscriptionGroup] =
+    await Promise.all([
+      findAllUserPropertyAssignments({ userId, workspaceId, context }),
+      // ↑ 这里获取到了所有用户属性，可能包含 language
+      // ...
+    ]);
+
+  // ... subscriptionGroupDetails 处理 ...
+
+  try {
+    const result = await sender({
+      workspaceId,
+      useDraft: false,
+      templateId,       // ← 仍然使用原始固定 ID
+      userId,
+      userPropertyAssignments,  // ← 传递给 sendMessage()
+      subscriptionGroupDetails,
+      messageTags,
+      ...rest,
+    });
+    return result;
+  } catch (senderError) {
+    // ... 重试逻辑 ...
+  }
+}
+```
+
+**关键发现**：
+- `findAllUserPropertyAssignments()` 获取到了用户属性（包括 `language`）
+- 但 `templateId` 从未被重新赋值，仍然是 Journey 节点中的固定值
+- 没有任何 `if (userPropertyAssignments.language === "zh-CN") { templateId = "..." }` 这样的逻辑
+
+#### 第 5 层：sendMessage() 分发
+
+**文件位置**：`packages/backend-lib/src/messaging.ts:2399-2420`
+
+```typescript
+export async function sendMessage(
+  params: SendMessageParameters,
+): Promise<BackendMessageSendResult> {
+  return withSpan({ name: "sendMessage" }, async (span) => {
+    span.setAttributes({
+      channel: params.channel,
+      workspaceId: params.workspaceId,
+      templateId: params.templateId,
+      // ⚠️ 没有 language 相关属性
+    });
+    switch (params.channel) {
+      case ChannelType.Email:
+        return sendEmail(params);
+      case ChannelType.Sms:
+        return sendSms(params);
+      case ChannelType.MobilePush:
+        throw new Error("not implemented");  // ← Mobile Push 发送未实现
+      case ChannelType.Webhook:
+        return sendWebhook(params);
+    }
+  });
+}
+```
+
+**SendMessageParameters**（`messaging.ts:510-543`）：
+```typescript
+interface SendMessageParametersBase {
+  workspaceId: string;
+  userId: string;
+  templateId: string;
+  userPropertyAssignments: UserPropertyAssignments;
+  subscriptionGroupDetails?: Omit<SubscriptionGroupDetails, "name">;
+  messageTags?: MessageTags;
+  useDraft?: boolean;
+  isPreview?: boolean;
+  // ⚠️ 无 language 参数
+}
+```
+
+#### 第 6-7 层：模板查询
+
+**文件位置**：`packages/backend-lib/src/messaging.ts:183-205`
+
+```typescript
+export async function findMessageTemplate({
+  id,         // ← 只有 ID 参数
+  channel,
+}: {
+  id: string;
+  channel: ChannelType;
+}): Promise<Result<MessageTemplateResource | null, Error>> {
+  if (!validateUuid(id)) {
+    logger().info({ id, channel }, "Invalid message template id");
+    return ok(null);
+  }
+  const template = await db().query.messageTemplate.findFirst({
+    where: eq(dbMessageTemplate.id, id),
+    // ⚠️ 只有 id 一个条件！
+    // ⚠️ 没有: eq(dbMessageTemplate.language, userLanguage)
+  });
+  if (!template) {
+    return ok(null);
+  }
+
+  return enrichMessageTemplate(template).map((t) => {
+    const definition = t.draft ?? t.definition ?? null;
+    return definition && definition.type === channel ? t : null;
+    // ⚠️ 只验证 channel 类型，不验证 language
+  });
+}
+```
+
+**调用者**（`messaging.ts:440-450`）：
+```typescript
+const [messageTemplateResult, subscriptionGroupSecret] = await Promise.all([
+  findMessageTemplate({
+    id: templateId,    // ← 固定 ID
+    channel,
+    // ⚠️ 没有传递 userPropertyAssignments
+    // ⚠️ 没有 language 参数
+  }),
+  // ...
+]);
+```
+
+#### 第 8 层：模板版本选择
+
+**文件位置**：`packages/backend-lib/src/messaging.ts:484-489`
+
+```typescript
+const definitionFromDraft =
+  useDraft && messageTemplate.draft
+    ? messageTemplateDraftToDefinition(messageTemplate.draft).unwrapOr(null)
+    : null;
+const messageTemplateDefinition: MessageTemplateResourceDefinition | null =
+  definitionFromDraft ?? messageTemplate.definition ?? null;
+
+if (!messageTemplateDefinition) {
+  return err({
+    type: InternalEventType.BadWorkspaceConfiguration,
+    variant: {
+      type: BadWorkspaceConfigurationType.MessageTemplateNotFound,
+      templateId,
+    },
+  });
+}
+```
+
+**优先级说明**：
+1. `useDraft=true` 且存在 `draft` → 使用 draft
+2. 否则使用 `definition`
+3. 都不存在 → 错误
+4. ⚠️ **完全没有** `zh-CN` → `en-US` → `default` 的语言版本 fallback 链
+
+#### 第 9-11 层：渠道发送与渲染
+
+以 **Email** 为例（`messaging.ts:889-969`）：
+```typescript
+// 渲染前：模板 ID 已固定
+const identifierKey =
+  messageTemplateDefinition.identifierKey ??
+  CHANNEL_IDENTIFIERS[ChannelType.Email];
+
+// 标识符值检查（无语言参与）
+const identifier = userPropertyAssignments[identifierKey];
+if (!identifier || typeof identifier !== "string") {
+  return err({ type: MessageSkippedType.MissingIdentifier, identifierKey });
+}
+
+// 批量渲染（只做变量绑定，不选模板）
+const renderedValues = renderValues({
+  templates: {
+    from: { contents: messageTemplateDefinition.from },
+    subject: { contents: messageTemplateDefinition.subject },
+    body: { contents: emailBody, mjml: true },
+    // ...
+  },
+  userProperties: userPropertyAssignments,  // ← language 作为普通变量
+  workspaceId,
+  subscriptionGroupId: subscriptionGroupDetails?.id,
+  identifierKey,
+  secrets: subscriptionGroupSecret,
+  tags: messageTags,
+  isPreview,
+  messageId,
+});
+```
+
+**renderLiquid**（`liquid.ts:269-285`）：
+```typescript
+const context = {
+  user: userProperties,       // ← language 在 user 对象中
+  workspace_id: workspaceId,
+  subscription_group_id: subscriptionGroupId,
+  identifier_key: identifierKey,
+  secrets,
+  tags,
+  is_preview: isPreview,
+  message_id: messageId,
+};
+const liquidRendered = await liquidEngine.parseAndRender(template, context);
+```
+
+### 3.2.2 数据模型缺失证明
+
+**MessageTemplate 表结构**（无 language 列）：
+
+**文件位置**：`packages/isomorphic-lib/src/types.ts:1856-1864`
+
+```typescript
+const MessageTemplateResourceProperties = {
+  workspaceId: Type.String(),
+  id: Type.String(),
+  name: Type.String(),
+  type: Type.Enum(ChannelType),
+  definition: Type.Optional(MessageTemplateResourceDefinition),
+  draft: Type.Optional(MessageTemplateResourceDraft),
+  updatedAt: Type.Number(),
+  // ⚠️ 无 language 列！
+  // ⚠️ 无 templateGroupId 列！
+} as const;
+```
+
+**结论**：无法存储 `(name, language)` 复合唯一的多语言版本。
+
+### 3.2.3 多语言调用链缺失总结
+
+| 检查点 | 代码位置 | 是否有 language 参与 |
+|--------|----------|---------------------|
+| Journey 节点定义 | `types.ts:1167` | ❌ 固定 templateId |
+| 参数类型定义 | `messaging.ts:510-543` | ❌ 无 language 字段 |
+| 模板查询 | `messaging.ts:183-205` | ❌ 仅按 id 查询 |
+| 模板版本选择 | `messaging.ts:484-489` | ❌ 仅 useDraft 控制 |
+| 数据模型 | `types.ts:1856-1864` | ❌ 无 language 列 |
+| 变量绑定 | `liquid.ts:269-285` | ✅ 作为普通 user 属性注入 |
+
+### 3.3 现有的 Fallback 机制
 
 系统中存在以下几种 **非语言相关** 的 fallback 机制：
 
-#### 3.2.1 模板版本 Fallback（Draft → Definition）
+#### 3.3.1 模板版本 Fallback（Draft → Definition）
 
 **文件位置**：`packages/backend-lib/src/messaging.ts:484-489`
 
@@ -271,7 +711,7 @@ const messageTemplateDefinition: MessageTemplateResourceDefinition | null =
 2. 否则使用 definition
 3. 都不存在 → 抛出错误
 
-#### 3.2.2 MJML 解析 Fallback
+#### 3.3.2 MJML 解析 Fallback
 
 **文件位置**：`packages/backend-lib/src/liquid.ts:292-293`
 
@@ -281,7 +721,7 @@ if (error.message.includes(MJML_NOT_PRESENT_ERROR)) {
 }
 ```
 
-#### 3.2.3 标识符键 Fallback
+#### 3.3.3 标识符键 Fallback
 
 **文件位置**：`packages/backend-lib/src/messaging.ts:891-893`
 
@@ -294,8 +734,9 @@ const identifierKey =
 **默认标识符**：
 - Email → `email`
 - SMS → `phone`
+- MobilePush → `deviceToken`
 
-### 3.3 多语言支持的基础设施
+### 3.4 多语言支持的基础设施
 
 虽然没有完整的多语言机制，但以下组件可用于未来扩展：
 
@@ -318,7 +759,7 @@ const identifierKey =
 defaultLanguageUserPropertyId: Type.Optional(Type.String()),
 ```
 
-### 3.4 模板中手动实现多语言
+### 3.5 模板中手动实现多语言
 
 用户可以通过 Liquid 条件判断手动实现简单的多语言：
 
@@ -576,12 +1017,39 @@ case ChannelType.Sms: {
 1. **模板引擎**：使用 Liquid 而非 Handlebars，但语法兼容
 2. **变量绑定**：通过 `renderLiquid` 注入，支持 `{{ user.xxx }}` 访问
 3. **MJML 支持**：Liquid 渲染后转换，失败时有优雅降级
-4. **多语言**：基础设施存在（language 用户属性），但无自动化 fallback
-5. **校验机制**：基础校验完善（变量、Schema、标识符），但缺少渠道特定限制（SMS 字符数等）
+4. **多语言**：基础设施存在（language 用户属性），但完整调用链中无语言参与的模板选择或 fallback
+5. **校验机制**：基础校验完善（变量、Schema、标识符），但缺少渠道特定限制
+
+### 多语言缺失详解
+
+经过完整调用链分析，多语言机制在三个层面缺失：
+
+| 层面 | 现状 | 后果 |
+|------|------|------|
+| **数据模型** | `MessageTemplate` 表无 `language` 列 | 无法存储同一模板的多种语言版本 |
+| **模板选择** | `findMessageTemplate({ id, channel })` 仅按 ID 查找 | 发送时无法根据 `user.language` 动态选择对应语言模板 |
+| **版本路由** | Journey/Broadcast 节点绑定固定 `templateId` | 即使有多语言模板，消息节点也无法动态路由 |
+
+### 各渠道限制校验现状
+
+| 渠道 | 变量校验 | Schema 校验 | 标识符校验 | 内容长度/大小校验 | 发送功能状态 |
+|------|---------|------------|-----------|------------------|-------------|
+| **Email** | ✅ | ✅ | ✅ | ❌ | ✅ |
+| **SMS** | ✅ | ✅ | ✅ | ❌（GSM-7/UCS-2 字符数） | ✅ |
+| **Mobile Push** | ✅（模板级） | ✅（模板级） | ✅ | ❌（4KB FCM/APNS 限制） | ❌（未实现） |
+| **Webhook** | ✅ | ✅ | - | ❌（JSON payload 大小） | ✅ |
 
 ### 建议改进方向
 
-1. **多语言支持**：实现基于 `user.language` 的模板版本选择和 fallback
-2. **SMS 校验**：添加 GSM-7/UCS-2 字符计数和分段警告
-3. **邮件校验**：添加主题行、发件人名称长度建议
-4. **附件限制**：添加文件大小检查
+1. **多语言支持**：
+   - 数据层：为 MessageTemplate 添加 `language` 列，引入 `templateGroupId`
+   - 查询层：实现 `findMessageTemplate({ templateGroupId, language })` 并 fallback 到默认语言
+   - 配置层：使用 `defaultLanguageUserPropertyId` 确定默认语言用户属性
+   - 发送层：在 `getSendMessageModels()` 中读取 `userPropertyAssignments[languageProp]` 进行模板选择
+
+2. **渠道限制校验**：
+   - **SMS**：添加 GSM-7/UCS-2 字符计数和分段警告
+   - **Mobile Push**：实现发送功能，并添加 FCM/APNS 4KB payload 检查
+   - **Email**：添加主题行、发件人名称长度建议
+   - **Webhook**：添加 payload 大小检查
+   - **附件**：添加文件大小检查
