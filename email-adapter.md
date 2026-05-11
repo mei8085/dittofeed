@@ -1,4 +1,4 @@
-# 邮件 Provider 协作方式分析报告（修订版）
+# 邮件 Provider 协作方式分析报告（修订版 v2）
 
 ## 1. 概述
 
@@ -478,235 +478,684 @@ switch (body.Type) {
 
 ---
 
-## 4. 消息标识连续性：Provider 切换时的 ID 管理
+## 4. 消息追踪链路详解
 
-### 4.1 四层 ID 体系
+### 4.1 核心概念澄清
 
-系统采用四层 ID 体系确保消息标识的连续性：
+在深入分析之前，先澄清几个容易混淆的概念：
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│               第一层：系统消息 ID (System Message ID)            │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │  生成时机：邮件发送前，由系统生成                          │  │
-│  │  生成方式：randomUUID()                                   │  │
-│  │  存储位置：messageTags.messageId                          │  │
-│  │  用途：作为消息的唯一标识，贯穿整个生命周期                │  │
-│  │  与 Provider：完全无关，切换 Provider 不影响              │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                          ↓                                      │
-├─────────────────────────────────────────────────────────────────┤
-│              第二层：Provider 消息 ID                           │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │  生成时机：邮件提交后，由 Provider 分配                    │  │
-│  │  格式：                                                    │  │
-│  │    - SendGrid: sg_message_id, smtp-id                     │  │
-│  │    - SES: event.mail.messageId                            │  │
-│  │    - Resend: email_id                                     │  │
-│  │    - PostMark: MessageID                                  │  │
-│  │    - MailChimp: msg._id                                   │  │
-│  │  用途：关联 webhook 事件与发送的邮件                      │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                          ↓                                      │
-├─────────────────────────────────────────────────────────────────┤
-│              第三层：事件 ID (Event Message ID)                 │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │  生成时机：处理 webhook 事件时                             │  │
-│  │  生成方式：                                                │  │
-│  │    - SendGrid processed/bounce/spamreport:               │  │
-│  │        `${event}:${smtpId}`                               │  │
-│  │    - SendGrid 其他事件 / SES / Resend 等:                 │  │
-│  │        uuidv5(`${event}:${providerMessageId}`, workspaceId)│  │
-│  │  存储位置：messageId 字段（事件的唯一标识）                │  │
-│  │  用途：确保同一消息+同一事件产生相同的事件 ID             │  │
-│  └───────────────────────────────────────────────────────────┘  │
-│                          ↓                                      │
-├─────────────────────────────────────────────────────────────────┤
-│           第四层：关联 ID (Origin Message ID)                   │
-│  ┌───────────────────────────────────────────────────────────┐  │
-│  │  来源：properties.messageId（第一层的系统消息 ID）         │  │
-│  │  存储位置：origin_message_id 列（物化视图提取）            │  │
-│  │  用途：关联发送事件和状态事件，确保追踪连续                │  │
-│  └───────────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────┘
+#### 4.1.1 什么是 `message_id`？
+
+每个事件（无论是 MessageSent 还是 EmailOpened）都有一个 `message_id` 字段，这是**事件自身的唯一标识**。
+
+- 存储位置：`user_events_v2.message_id`
+- 生成方式：取决于事件类型
+  - MessageSent：外部传入或系统生成
+  - SendGrid processed/bounce/spamreport：`${event}:${smtpId}`
+  - SendGrid 其他事件 / SES 等：uuidv5(`${event}:${providerMsgId}`, workspaceId)
+
+#### 4.1.2 什么是 `origin_message_id`？
+
+`origin_message_id` 不是发送事件天然就有的，而是**通过物化视图从 properties 中提取的系统消息 ID**。
+
+```sql
+-- userEvents/clickhouse.ts:65
+JSONExtractString(properties, 'messageId') as origin_message_id
 ```
 
-### 4.2 系统消息 ID 生成
+- 来源：`properties.messageId`（系统消息 ID）
+- 用途：关联发送事件和状态事件
+- 特点：所有事件（MessageSent 和状态事件）都可以有 origin_message_id
 
-**文件：** `packages/backend-lib/src/messaging.ts`
+#### 4.1.3 什么是系统消息 ID？
 
-系统消息 ID 在邮件发送前由系统生成，与 Provider 无关：
+系统消息 ID 是在**发送前生成的、与 Provider 无关的**唯一标识。
 
-```typescript
-// messaging.ts:2443-2446（预览发送）
-const messageTags: MessageTags = {
-  ...(request.tags ?? {}),
-  messageId: request.tags?.messageId ?? randomUUID(),
-};
+- 生成方式：`randomUUID()`
+- 注入位置：messageTags.messageId
+- 传递路径：
+  - 发送时 → 注入到 Provider 元数据（customArgs/EmailTags/tags 等）
+  - webhook 时 → 从元数据提取 → 放入 `properties.messageId`
+  - 物化视图 → 提取为 `origin_message_id`
 
-// messaging.ts:2589-2629（批量发送）
-const messagePromises = users.map(async (user) => {
-  const messageId = user.messageId ?? randomUUID();
-  // ...
-  const messageTags: MessageTags = {
-    messageId,
-    workspaceId,
-    templateId,
-    userId: user.id,
-  };
-});
+### 4.2 字段流向全景图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           字段流向全景图                                      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  阶段 1: 发送邮件                                                            │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  1. 生成系统消息 ID: sys-msg-001 = randomUUID()                       │  │
+│  │  2. 放入 messageTags: { messageId: "sys-msg-001", ... }               │  │
+│  │  3. 注入 Provider 元数据:                                             │  │
+│  │     - SendGrid: customArgs.messageId = "sys-msg-001"                  │  │
+│  │     - SES: EmailTags.messageId = "sys-msg-001"                        │  │
+│  │     - Resend: tags.messageId = "sys-msg-001"                          │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                      ↓                                       │
+│  阶段 2: Provider 发送邮件                                                   │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  SendGrid 分配: sg_message_id, smtp-id                               │  │
+│  │  SES 分配: event.mail.messageId                                      │  │
+│  │  Resend 分配: email_id                                                │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                      ↓                                       │
+│  阶段 3: Webhook 接收                                                        │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  SendGrid webhook:                                                    │  │
+│  │  ├─ customArgs.messageId = "sys-msg-001"  (回传的系统消息 ID)         │  │
+│  │  └─ sg_message_id / smtp-id           (Provider 消息 ID)             │  │
+│  │                                                                       │  │
+│  │  SES SNS 通知:                                                        │  │
+│  │  ├─ mail.tags.messageId = ["sys-msg-001"]  (回传的系统消息 ID)       │  │
+│  │  └─ mail.messageId                    (Provider 消息 ID)              │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                      ↓                                       │
+│  阶段 4: 事件归一化                                                          │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  生成 BatchTrackData:                                                 │  │
+│  │  {                                                                    │  │
+│  │    messageId: "事件自身 ID",      ← 事件的唯一标识                    │  │
+│  │    event: "DFEmailOpened",                                            │  │
+│  │    properties: {                                                      │  │
+│  │      messageId: "sys-msg-001",   ← 系统消息 ID，用于关联              │  │
+│  │      ...                                                              │  │
+│  │    }                                                                  │  │
+│  │  }                                                                    │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                      ↓                                       │
+│  阶段 5: 存储到 ClickHouse                                                   │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  user_events_v2 表:                                                   │  │
+│  │  ├─ message_id: "事件自身 ID"                                        │  │
+│  │  ├─ properties: "{ messageId: 'sys-msg-001', ... }"                  │  │
+│  │  └─ event: "DFEmailOpened"                                           │  │
+│  │                                                                       │  │
+│  │  ↓ 物化视图 internal_events_mv                                       │  │
+│  │                                                                       │  │
+│  │  internal_events 表:                                                  │  │
+│  │  ├─ message_id: "事件自身 ID"                                        │  │
+│  │  ├─ origin_message_id: "sys-msg-001"  ← 从 properties.messageId 提取│  │
+│  │  └─ event: "DFEmailOpened"                                           │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+│                                      ↓                                       │
+│  阶段 6: 投递查询                                                            │
+│  ┌───────────────────────────────────────────────────────────────────────┐  │
+│  │  message_sends CTE:                                                    │  │
+│  │  ├─ 筛选: event = 'DFInternalMessageSent'                            │  │
+│  │  └─ 选取: message_id (发送事件的事件自身 ID)                           │  │
+│  │                                                                       │  │
+│  │  status_events CTE:                                                   │  │
+│  │  ├─ 筛选: 状态事件 (EmailOpened, EmailClicked 等)                     │  │
+│  │  └─ 选取: origin_message_id (系统消息 ID)                            │  │
+│  │                                                                       │  │
+│  │  关联条件:                                                            │  │
+│  │  └─ ms.message_id = se.origin_message_id  ← 关键关联！               │  │
+│  └───────────────────────────────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-**关键点：**
-- 使用 Node.js 内置的 `crypto.randomUUID()` 生成
-- 如果调用方已提供 messageId，则使用提供的 ID
-- messageId 作为元数据的一部分注入到邮件中
+### 4.3 关键关联机制详解
 
-### 4.3 元数据注入机制
-
-系统消息 ID 通过各 Provider 特有的元数据字段注入：
-
-| Provider | 注入字段 | 代码位置 |
-|---------|---------|---------|
-| SendGrid | `customArgs` | messaging.ts:1262-1266 |
-| Amazon SES | `EmailTags` | messaging.ts:1336-1340 |
-| Resend | `tags` | messaging.ts:1499-1501 |
-| PostMark | `Metadata` | messaging.ts:1572-1593 |
-| MailChimp | `metadata` | messaging.ts:1663-1674 |
-
-**统一元数据字段（MESSAGE_METADATA_FIELDS）：**
-
-**文件：** `packages/backend-lib/src/constants.ts`
-
-```typescript
-export const MESSAGE_METADATA_FIELDS = [
-  "workspaceId",
-  "broadcastId",
-  "journeyId",
-  "runId",
-  "messageId",      // 系统消息 ID，关键！
-  "userId",
-  "templateId",
-  "nodeId",
-] as const;
-```
-
-### 4.4 事件存储与物化视图
+#### 4.3.1 物化视图：origin_message_id 的来源
 
 **文件：** `packages/backend-lib/src/userEvents/clickhouse.ts`
 
-事件首先存储到 `user_events_v2` 表，然后通过物化视图提取到 `internal_events` 表：
+`origin_message_id` 不是事件表原生就有的字段，而是通过物化视图**动态提取**的：
 
 ```sql
--- 主表：user_events_v2
-CREATE TABLE IF NOT EXISTS user_events_v2 (
-  message_id String,    -- 事件 ID（第三层）
-  properties String,    -- JSON，包含系统消息 ID
-  workspace_id String,
-  -- ...
-);
-
--- 物化视图：internal_events
 CREATE MATERIALIZED VIEW IF NOT EXISTS internal_events_mv
 TO internal_events
 AS SELECT
   message_id,
-  JSONExtractString(properties, 'messageId') as origin_message_id,  -- 系统消息 ID
-  -- ...
+  event,
+  -- ... 其他字段
+  JSONExtractString(properties, 'messageId') as origin_message_id,  -- 关键！
+  hidden
 FROM user_events_v2
 WHERE event_type = 'track' AND startsWith(event, 'DF');
 ```
 
-**关键提取：**
-```typescript
-// clickhouse.ts:65
-JSONExtractString(properties, 'messageId') as origin_message_id
-```
+**关键点：**
+- `origin_message_id` = `properties.messageId`
+- `properties.messageId` 是系统消息 ID
+- 所有 DF 前缀的 track 事件都可以有 origin_message_id
+- **发送事件天然没有 origin_message_id 字段**，是物化视图提取的
 
-这意味着：
-- `origin_message_id` 是从 `properties.messageId` 提取的
-- 这就是**第一层的系统消息 ID**
-- 与 Provider 完全无关
-
-### 4.5 投递追踪中的消息关联
+#### 4.3.2 投递查询的关联逻辑
 
 **文件：** `packages/backend-lib/src/deliveries.ts`
 
-投递查询通过 `origin_message_id` 关联发送事件和状态事件：
+投递查询使用两个 CTE（Common Table Expression）来关联发送事件和状态事件：
 
 ```sql
--- deliveries.ts:400-413
+-- CTE 1: message_sends - 发送事件
 WITH message_sends AS (
-  -- 发送事件（MessageSent）
-  SELECT message_id, ...
-  FROM internal_events
-  WHERE event = 'DFInternalMessageSent'
-),
-status_events AS (
-  -- 状态事件（opened, clicked 等）
   SELECT
-    origin_message_id,  -- 系统消息 ID，用于关联
-    argMax(event, event_time) as last_event,
-    ...
+    workspace_id,
+    user_or_anonymous_id,
+    processing_time,
+    message_id,           -- 发送事件的事件自身 ID
+    event_time,
+    triggering_message_id
   FROM internal_events
-  WHERE origin_message_id IN (
-    SELECT message_id FROM message_sends  -- 关联条件
-  )
+  WHERE
+    event = 'DFInternalMessageSent'  -- 筛选发送事件
+    AND ... 其他过滤条件
+),
+
+-- CTE 2: status_events - 状态事件
+status_events AS (
+  SELECT
+    workspace_id,
+    user_or_anonymous_id,
+    origin_message_id,    -- 从 properties.messageId 提取的系统消息 ID
+    argMax(event, event_time) as last_event,
+    max(event_time) as max_event_time
+  FROM internal_events
+  WHERE
+    ... 状态事件过滤条件
+    AND origin_message_id IN (
+      SELECT message_id FROM message_sends  -- 只关联有发送事件的状态
+    )
   GROUP BY workspace_id, user_or_anonymous_id, origin_message_id
 )
+
 -- 最终关联
+FROM message_sends ms
 LEFT JOIN status_events se ON
   ms.workspace_id = se.workspace_id
   AND ms.message_id = se.origin_message_id  -- 关键关联！
   AND ms.user_or_anonymous_id = se.user_or_anonymous_id
 ```
 
-**关联逻辑图解：**
+**关联逻辑解析：**
 
-```
-MessageSent 事件:
-┌─────────────────────────────────────────┐
-│ message_id: "msg-sent-uuid-123"         │  ← 发送事件的事件 ID
-│ event: "DFInternalMessageSent"          │
-│ properties: {                           │
-│   messageId: "system-uuid-abc",         │  ← 系统消息 ID
-│   variant: { type: "Email", ... }       │
-│ }                                       │
-└─────────────────────────────────────────┘
+| 来源 | 字段 | 含义 |
+|-----|------|------|
+| message_sends (ms) | `message_id` | 发送事件的**事件自身 ID** |
+| status_events (se) | `origin_message_id` | 状态事件的**系统消息 ID**（从 properties.messageId 提取） |
+| 关联条件 | `ms.message_id = se.origin_message_id` | 发送事件的事件 ID = 状态事件的系统消息 ID |
 
-EmailOpened 事件:
-┌─────────────────────────────────────────┐
-│ message_id: "uuidv5-event-456"          │  ← 事件 ID（第三层）
-│ event: "DFEmailOpened"                  │
-│ properties: {                           │
-│   messageId: "system-uuid-abc",         │  ← 系统消息 ID（与上面相同！）
-│   email: "user@example.com"             │
-│ }                                       │
-│ (物化视图提取)                           │
-│ origin_message_id: "system-uuid-abc"    │  ← 从 properties.messageId 提取
-└─────────────────────────────────────────┘
+**这意味着：**
+- MessageSent 事件的 `message_id`（事件自身 ID）必须等于系统消息 ID
+- 状态事件的 `origin_message_id` 也等于系统消息 ID
+- 因此可以通过系统消息 ID 关联
 
-关联查询:
-ms.message_id (发送事件的事件 ID)
-  = se.origin_message_id (状态事件的系统消息 ID)?  ← 不对！
-```
+### 4.4 完整示例：从发送到投递查询
 
-**注意：** 仔细分析代码，发送事件的 `message_id` 是发送事件的事件 ID，而状态事件的 `origin_message_id` 是系统消息 ID。这意味着它们通过**系统消息 ID** 进行关联。
+让我们通过一个完整的示例来理解整个字段流向。
 
-让我重新查看发送事件的结构...
+#### 4.4.1 场景设定
 
-实际上，发送事件（MessageSent）在提交时也会将系统消息 ID 放入 `properties.messageId`。让我验证这一点：
+- 工作区 ID：`ws-123`
+- 用户 ID：`user-456`
+- 模板 ID：`tpl-789`
+- Provider：先使用 SendGrid，后切换到 SES
+
+#### 4.4.2 阶段 1：使用 SendGrid 发送邮件 M1
+
+**步骤 1：生成系统消息 ID**
 
 ```typescript
-// 在 messaging.ts 中，发送成功后会生成 MessageSent 事件
-// 该事件的 properties 中包含 messageTags 中的 messageId
+// messaging.ts:2443-2446
+const messageTags: MessageTags = {
+  messageId: randomUUID(),  // 生成：sys-msg-001
+  workspaceId: "ws-123",
+  templateId: "tpl-789",
+  userId: "user-456",
+  // ... 其他字段
+};
 ```
 
-是的，发送事件和状态事件都通过 `properties.messageId` 包含系统消息 ID，这个值被提取到 `origin_message_id` 用于关联。
+**步骤 2：注入到 SendGrid customArgs**
 
-### 4.6 Provider 切换时的连续性保证
+```typescript
+// messaging.ts:1262-1266
+const mailData: MailDataRequired = {
+  to: "user@example.com",
+  from: "sender@example.com",
+  subject: "Test Email",
+  html: "<div>Hello</div>",
+  customArgs: {
+    workspaceId: "ws-123",
+    templateId: "tpl-789",
+    ...messageTags,  // messageId: "sys-msg-001"
+  },
+};
+```
 
-#### 4.6.1 场景分析
+**步骤 3：MessageSent 事件存储**
+
+```typescript
+// 提交到系统
+{
+  messageId: "sys-msg-001",           // 事件自身 ID = 系统消息 ID
+  type: EventType.Track,
+  event: "DFInternalMessageSent",
+  userId: "user-456",
+  properties: {
+    messageId: "sys-msg-001",         // 系统消息 ID（重复一份，用于关联）
+    workspaceId: "ws-123",
+    templateId: "tpl-789",
+    journeyId: "jrn-abc",
+    variant: {
+      type: "Email",
+      from: "sender@example.com",
+      to: "user@example.com",
+      provider: { type: "SendGrid" }
+    }
+  },
+  timestamp: "2024-01-01T10:00:00.000Z",
+}
+```
+
+**存储到 user_events_v2：**
+
+| message_id | event | properties |
+|-----------|-------|-----------|
+| sys-msg-001 | DFInternalMessageSent | { messageId: "sys-msg-001", ... } |
+
+**物化到 internal_events：**
+
+| message_id | event | origin_message_id |
+|-----------|-------|------------------|
+| sys-msg-001 | DFInternalMessageSent | sys-msg-001 |
+
+#### 4.4.3 阶段 2：SendGrid processed webhook
+
+SendGrid 接收邮件后发送 processed 事件：
+
+```typescript
+// SendGrid webhook 数据
+{
+  event: "processed",
+  email: "user@example.com",
+  "smtp-id": "smtp-xyz-123",
+  sg_message_id: "sg-abc-456",
+  customArgs: {
+    workspaceId: "ws-123",
+    messageId: "sys-msg-001",
+    userId: "user-456",
+    templateId: "tpl-789"
+  },
+  timestamp: 1704099610  // 10:00:10
+}
+```
+
+**归一化为 BatchTrackData：**
+
+```typescript
+// sendgrid.ts:102-136
+// processed 事件使用 smtp-id 前缀
+messageId = `processed:${smtpId}` = "processed:smtp-xyz-123"
+
+// 提取 customArgs 到 properties
+{
+  messageId: "processed:smtp-xyz-123",
+  type: EventType.Track,
+  event: "DFEmailProcessed",
+  userId: "user-456",
+  properties: {
+    messageId: "sys-msg-001",         // 系统消息 ID
+    workspaceId: "ws-123",
+    userId: "user-456",
+    templateId: "tpl-789",
+    smtpId: "smtp-xyz-123"
+  },
+  timestamp: "2024-01-01T10:00:10.000Z",
+}
+```
+
+**存储到 user_events_v2：**
+
+| message_id | event | properties |
+|-----------|-------|-----------|
+| processed:smtp-xyz-123 | DFEmailProcessed | { messageId: "sys-msg-001", ... } |
+
+**物化到 internal_events：**
+
+| message_id | event | origin_message_id |
+|-----------|-------|------------------|
+| processed:smtp-xyz-123 | DFEmailProcessed | sys-msg-001 |
+
+#### 4.4.4 阶段 3：SendGrid delivered webhook
+
+收件人收到邮件后，SendGrid 发送 delivered 事件：
+
+```typescript
+// SendGrid webhook 数据
+{
+  event: "delivered",
+  email: "user@example.com",
+  sg_message_id: "sg-abc-456",
+  customArgs: {
+    workspaceId: "ws-123",
+    messageId: "sys-msg-001",
+    userId: "user-456"
+  },
+  timestamp: 1704100210  // 10:10:10
+}
+```
+
+**归一化为 BatchTrackData：**
+
+```typescript
+// sendgrid.ts:130-133
+// delivered 事件使用 uuidv5
+messageId = uuidv5(
+  "delivered:sg-abc-456",
+  "ws-123"
+) = "uuidv5-result-789"
+
+// 提交
+{
+  messageId: "uuidv5-result-789",
+  type: EventType.Track,
+  event: "DFEmailDelivered",
+  userId: "user-456",
+  properties: {
+    messageId: "sys-msg-001",         // 系统消息 ID
+    workspaceId: "ws-123",
+    ...
+  },
+  timestamp: "2024-01-01T10:10:10.000Z",
+}
+```
+
+**存储到 user_events_v2：**
+
+| message_id | event | properties |
+|-----------|-------|-----------|
+| uuidv5-result-789 | DFEmailDelivered | { messageId: "sys-msg-001", ... } |
+
+**物化到 internal_events：**
+
+| message_id | event | origin_message_id |
+|-----------|-------|------------------|
+| uuidv5-result-789 | DFEmailDelivered | sys-msg-001 |
+
+#### 4.4.5 阶段 4：切换 Provider 到 SES
+
+```
+时间线推进，工作区配置更新：
+  Provider: SendGrid → SES
+```
+
+#### 4.4.6 阶段 5：使用 SES 发送邮件 M2
+
+**步骤 1：生成新的系统消息 ID**
+
+```typescript
+const messageTags: MessageTags = {
+  messageId: randomUUID(),  // 生成：sys-msg-002（新的！）
+  workspaceId: "ws-123",
+  templateId: "tpl-789",
+  userId: "user-456",
+};
+```
+
+**步骤 2：注入到 SES EmailTags**
+
+```typescript
+const mailData: SesMailData = {
+  to: "user@example.com",
+  from: "sender@example.com",
+  tags: {
+    workspaceId: "ws-123",
+    templateId: "tpl-789",
+    ...messageTags,  // messageId: "sys-msg-002"
+  },
+};
+```
+
+**步骤 3：MessageSent 事件存储**
+
+```typescript
+{
+  messageId: "sys-msg-002",           // 事件自身 ID = 新的系统消息 ID
+  event: "DFInternalMessageSent",
+  properties: {
+    messageId: "sys-msg-002",         // 系统消息 ID
+    ...
+  },
+}
+```
+
+**存储到 internal_events：**
+
+| message_id | event | origin_message_id |
+|-----------|-------|------------------|
+| sys-msg-002 | DFInternalMessageSent | sys-msg-002 |
+
+#### 4.4.7 阶段 6：SES delivered webhook
+
+```typescript
+// SES SNS 通知
+{
+  notificationType: "Delivery",
+  mail: {
+    messageId: "ses-def-789",
+    destination: ["user@example.com"],
+    tags: {
+      workspaceId: ["ws-123"],
+      messageId: ["sys-msg-002"],
+      userId: ["user-456"]
+    }
+  }
+}
+```
+
+**归一化为 BatchTrackData：**
+
+```typescript
+// amazonses.ts:243-246
+messageId = uuidv5(
+  "Delivery:ses-def-789",
+  "ws-123"
+) = "uuidv5-result-abc"
+
+// 提交
+{
+  messageId: "uuidv5-result-abc",
+  event: "DFEmailDelivered",
+  properties: {
+    messageId: "sys-msg-002",         // 系统消息 ID（新的！）
+    ...
+  },
+}
+```
+
+**存储到 internal_events：**
+
+| message_id | event | origin_message_id |
+|-----------|-------|------------------|
+| uuidv5-result-abc | DFEmailDelivered | sys-msg-002 |
+
+#### 4.4.8 阶段 7：SendGrid 延迟 bounce webhook
+
+几天后，SendGrid 发送延迟的 bounce 事件：
+
+```typescript
+// SendGrid webhook 数据（延迟）
+{
+  event: "bounce",
+  email: "user@example.com",
+  "smtp-id": "smtp-xyz-123",
+  // 注意：没有 customArgs！没有 workspaceId、userId
+  timestamp: 1704358810  // 3 天后
+}
+```
+
+**延迟事件回填处理：**
+
+```typescript
+// sendgrid.ts:241-306
+// 1. 分离延迟事件
+delayedEvents.set("smtp-xyz-123", bounceEvent);
+
+// 2. 查找已存储的 processed 事件
+const processedEvents = await findUserEventsById({
+  messageIds: ["processed:smtp-xyz-123"],
+});
+
+// 3. 找到 EmailProcessed 事件，回填元数据
+// processed 事件的 properties 包含：
+// {
+//   messageId: "sys-msg-001",
+//   workspaceId: "ws-123",
+//   userId: "user-456",
+//   templateId: "tpl-789"
+// }
+
+// 4. 生成 EmailBounced 事件
+messageId = `bounce:${smtpId}` = "bounce:smtp-xyz-123"
+
+{
+  messageId: "bounce:smtp-xyz-123",
+  event: "DFEmailBounced",
+  userId: "user-456",                    // 回填的
+  properties: {
+    messageId: "sys-msg-001",           // 回填的系统消息 ID！
+    workspaceId: "ws-123",              // 回填的
+    ...
+  },
+}
+```
+
+**存储到 internal_events：**
+
+| message_id | event | origin_message_id |
+|-----------|-------|------------------|
+| bounce:smtp-xyz-123 | DFEmailBounced | sys-msg-001 |
+
+#### 4.4.9 阶段 8：投递查询
+
+现在查询投递状态，看看 Provider 切换后是否能正确关联：
+
+```sql
+-- message_sends CTE: 筛选发送事件
+SELECT message_id
+FROM internal_events
+WHERE event = 'DFInternalMessageSent'
+AND workspace_id = 'ws-123'
+
+-- 结果：
+-- message_id
+-- sys-msg-001
+-- sys-msg-002
+
+-- status_events CTE: 筛选状态事件
+SELECT origin_message_id, argMax(event, event_time) as last_event
+FROM internal_events
+WHERE event IN ('DFEmailDelivered', 'DFEmailBounced', ...)
+AND origin_message_id IN ('sys-msg-001', 'sys-msg-002')
+GROUP BY origin_message_id
+
+-- 结果：
+-- origin_message_id | last_event
+-- sys-msg-001       | DFEmailBounced  （延迟事件正确关联！）
+-- sys-msg-002       | DFEmailDelivered
+
+-- 最终关联
+FROM message_sends ms
+LEFT JOIN status_events se ON
+  ms.workspace_id = se.workspace_id
+  AND ms.message_id = se.origin_message_id  -- 关键关联！
+
+-- 关联结果：
+-- ms.message_id = sys-msg-001  →  se.origin_message_id = sys-msg-001  ✓ 匹配！
+-- ms.message_id = sys-msg-002  →  se.origin_message_id = sys-msg-002  ✓ 匹配！
+```
+
+**最终查询结果：**
+
+| message_id (ms) | origin_message_id (se) | last_event |
+|----------------|----------------------|------------|
+| sys-msg-001 | sys-msg-001 | DFEmailBounced |
+| sys-msg-002 | sys-msg-002 | DFEmailDelivered |
+
+**🎉 Provider 切换后，历史数据仍然正确关联！**
+
+### 4.5 为什么 Provider 切换后还能关联？
+
+通过上面的示例，我们可以清晰地看到 **3 个关键设计**确保了连续性：
+
+#### 设计 1：系统消息 ID 独立于 Provider
+
+```
+发送 M1 (SendGrid):
+  系统消息 ID = randomUUID() → sys-msg-001
+  注入到 customArgs → webhook 回传 → properties.messageId
+  物化视图 → origin_message_id = sys-msg-001
+
+发送 M2 (SES):
+  系统消息 ID = randomUUID() → sys-msg-002
+  注入到 EmailTags → SNS 通知 → properties.messageId
+  物化视图 → origin_message_id = sys-msg-002
+
+连续性保证：
+  ✓ 生成逻辑不变（始终是 randomUUID()）
+  ✓ 存储路径不变（始终是 properties.messageId → origin_message_id）
+  ✓ 与 Provider 分配的 ID 完全解耦
+```
+
+#### 设计 2：延迟事件回填（SendGrid 特有）
+
+```
+T1 (SendGrid):
+  发送 M1 → 系统消息 ID = sys-msg-001
+  processed webhook → 存储 EmailProcessed 事件
+    → properties.messageId = sys-msg-001
+
+T2 (切换到 SES):
+  配置更新
+
+T3 (延迟 bounce):
+  bounce webhook 只有 smtp-id，没有元数据
+  系统查找 message_id = "processed:smtp-xyz" 的事件
+  找到 EmailProcessed 事件
+  从 properties 提取：
+    messageId = sys-msg-001
+    workspaceId = ws-123
+    userId = user-456
+  回填到 bounce 事件
+  EmailBounced 事件的 properties.messageId = sys-msg-001
+
+结果：
+  ✓ 即使 Provider 切换了
+  ✓ 延迟事件仍然能正确关联到历史发送
+  ✓ origin_message_id = sys-msg-001
+```
+
+#### 设计 3：关联键是系统消息 ID，不是 Provider ID
+
+```
+关联条件: ms.message_id = se.origin_message_id
+
+左边 ms.message_id:
+  是 MessageSent 事件的事件自身 ID
+  等于系统消息 ID
+
+右边 se.origin_message_id:
+  是状态事件的系统消息 ID
+  从 properties.messageId 提取
+  properties.messageId 来自 Provider 元数据
+  Provider 元数据来自发送时注入的系统消息 ID
+
+结果：
+  ✓ 两边都是系统消息 ID
+  ✓ 与 Provider 分配的 ID（sg_message_id, SES messageId）无关
+  ✓ Provider 切换不影响关联
+```
+
+---
+
+## 5. Provider 切换时的连续性保证
+
+### 5.1 场景分析
 
 假设同一工作区先使用 SendGrid 发送邮件，后切换到 SES：
 
@@ -720,19 +1169,19 @@ T1: 发送邮件 M1（SendGrid）
     ├─ SendGrid smtp-id: smtp-xyz
     │
     ├─ 生成 MessageSent 事件
-    │   └─ messageId (事件 ID): event-sent-001
+    │   └─ message_id (事件自身 ID): sys-msg-001
     │   └─ properties.messageId: sys-msg-001
     │   └─ origin_message_id (物化后): sys-msg-001
     │
     ├─ SendGrid processed webhook
     │   └─ 生成 EmailProcessed 事件
-    │       └─ messageId (事件 ID): "processed:smtp-xyz"
+    │       └─ message_id (事件自身 ID): "processed:smtp-xyz"
     │       └─ properties.messageId: sys-msg-001
     │       └─ origin_message_id (物化后): sys-msg-001
     │
     └─ SendGrid delivered webhook
         └─ 生成 EmailDelivered 事件
-            └─ messageId (事件 ID): uuidv5("delivered:sg-abc", ws-id)
+            └─ message_id (事件自身 ID): uuidv5("delivered:sg-abc", ws-id)
             └─ properties.messageId: sys-msg-001
             └─ origin_message_id (物化后): sys-msg-001
 
@@ -744,13 +1193,13 @@ T3: 发送邮件 M2（SES）
     ├─ SES messageId: ses-def
     │
     ├─ 生成 MessageSent 事件
-    │   └─ messageId (事件 ID): event-sent-002
+    │   └─ message_id (事件自身 ID): sys-msg-002
     │   └─ properties.messageId: sys-msg-002
     │   └─ origin_message_id (物化后): sys-msg-002
     │
     └─ SES delivered webhook
         └─ 生成 EmailDelivered 事件
-            └─ messageId (事件 ID): uuidv5("Delivery:ses-def", ws-id)
+            └─ message_id (事件自身 ID): uuidv5("Delivery:ses-def", ws-id)
             └─ properties.messageId: sys-msg-002
             └─ origin_message_id (物化后): sys-msg-002
 
@@ -759,12 +1208,12 @@ T4: SendGrid 延迟发送 bounce 事件
     └─ 系统查找 "processed:smtp-xyz" 事件
     └─ 找到 EmailProcessed 事件，回填元数据
     └─ 生成 EmailBounced 事件
-        └─ messageId (事件 ID): "bounce:smtp-xyz"
+        └─ message_id (事件自身 ID): "bounce:smtp-xyz"
         └─ properties.messageId: sys-msg-001
         └─ origin_message_id (物化后): sys-msg-001
 ```
 
-#### 4.6.2 连续性保证的三个关键点
+### 5.2 连续性保证的三个关键点
 
 **关键点 1：系统消息 ID 独立于 Provider**
 
@@ -829,7 +1278,7 @@ Provider 切换影响：
   ✅ 不影响历史数据的查询
 ```
 
-#### 4.6.3 连续性对比：SendGrid vs SES
+### 5.3 连续性对比：SendGrid vs SES
 
 | 维度 | SendGrid | SES |
 |-----|---------|-----|
@@ -840,7 +1289,7 @@ Provider 切换影响：
 | **origin_message_id** | 从 properties.messageId 提取（系统消息 ID） | 从 properties.messageId 提取（系统消息 ID） |
 | **Provider 切换影响** | 无（系统消息 ID 独立） | 无（系统消息 ID 独立） |
 
-### 4.7 UUID v5 详解
+### 5.4 UUID v5 详解
 
 所有 Provider（SendGrid 部分事件除外）都使用 `uuid v5` 算法生成确定性的内部事件 ID：
 
@@ -866,9 +1315,9 @@ messageId = uuidv5(
 
 ---
 
-## 5. 架构总结
+## 6. 架构总结
 
-### 5.1 整体架构图
+### 6.1 整体架构图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -978,16 +1427,18 @@ messageId = uuidv5(
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    投递查询层 (Delivery Query)                       │
 │  ┌──────────────────────────────────────────────────────────────┐  │
-│  │  message_sends (MessageSent 事件)                            │  │
-│  │    message_id = 发送事件的事件 ID                             │  │
-│  │    origin_message_id = 系统消息 ID                            │  │
+│  │  message_sends CTE:                                          │  │
+│  │    筛选: event = 'DFInternalMessageSent'                     │  │
+│  │    选取: message_id (发送事件的事件 ID)                      │  │
 │  │                                                              │  │
-│  │  status_events (状态事件)                                    │  │
-│  │    origin_message_id = 系统消息 ID                            │  │
+│  │  status_events CTE:                                          │  │
+│  │    筛选: 状态事件                                            │  │
+│  │    选取: origin_message_id (系统消息 ID)                     │  │
 │  │                                                              │  │
 │  │  关联条件:                                                   │  │
 │  │    ms.message_id = se.origin_message_id                      │  │
-│  │    ↓ 实际上是通过系统消息 ID 关联                              │  │
+│  │    ↓ 实际上是:                                               │  │
+│  │    发送事件的事件 ID = 状态事件的系统消息 ID                  │  │
 │  │                                                              │  │
 │  │  结果: 发送事件和状态事件正确关联                            │  │
 │  │       无论使用哪个 Provider                                 │  │
@@ -995,7 +1446,7 @@ messageId = uuidv5(
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 关键设计原则
+### 6.2 关键设计原则
 
 1. **分层抽象**
    - 发送层：统一的 `sendEmail` 入口，屏蔽 Provider 差异
@@ -1017,11 +1468,16 @@ messageId = uuidv5(
    - 与 Provider 分配的 ID 完全解耦
    - Provider 切换不影响历史数据的追踪连续性
 
-5. **签名验证**
+5. **物化视图提取**
+   - `origin_message_id` 不是事件表原生字段
+   - 通过物化视图从 `properties.messageId` 动态提取
+   - 所有 DF 前缀的 track 事件都可以有 origin_message_id
+
+6. **签名验证**
    - 每个 webhook 端点都有独立的签名验证机制
    - 防止伪造的事件注入
 
-### 5.3 文件索引
+### 6.3 文件索引
 
 | 功能 | 文件路径 |
 |-----|---------|
@@ -1039,7 +1495,7 @@ messageId = uuidv5(
 | 类型定义 | `packages/isomorphic-lib/src/types.ts` |
 | 批量提交 | `packages/backend-lib/src/apps/batch.ts` |
 
-### 5.4 核心代码位置速查
+### 6.4 核心代码位置速查
 
 **SendGrid 事件 ID 双轨策略：**
 - 位置：`packages/backend-lib/src/destinations/sendgrid.ts:102-136`
@@ -1059,5 +1515,4 @@ messageId = uuidv5(
 - 关键：`JSONExtractString(properties, 'messageId') as origin_message_id`
 
 **投递查询关联：**
-- 位置：`packages/backend-lib/src/deliveries.ts:432-435`
-- 关键：`ms.message_id = se.origin_message_id`
+- 位置：
