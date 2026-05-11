@@ -933,14 +933,338 @@ defaultLanguageUserPropertyId: Type.Optional(Type.String()),
 | Schema 结构校验 | ✅ 实现 | 保存和渲染时 |
 | SMS 字符数限制 | ❌ 未实现 | - |
 | 邮件主题长度 | ❌ 未实现 | - |
+| Mobile Push Payload 限制 | ❌ 未实现 | - |
 | 附件大小限制 | ❌ 未实现 | - |
 | Webhook 负载大小 | ❌ 未实现 | - |
 
-### 4.2 模板保存时的校验
+### 4.2 Mobile Push 渠道完整分析
+
+#### 4.2.1 contentController 测试发送入口的未实现位置
+
+**API 路由定义**（`packages/api/src/controllers/contentController.ts:320-563`）：
+
+```typescript
+fastify.withTypeProvider<TypeBoxTypeProvider>().post(
+  "/templates/test",
+  {
+    schema: {
+      description: "Send a test message for a message template.",
+      tags: ["Content"],
+      body: MessageTemplateTestRequest,
+      response: {
+        200: MessageTemplateTestResponse,
+      },
+    },
+  },
+  async (request, reply) => {
+    const result = await testTemplate(request.body);
+    // ... 错误处理（没有 Mobile Push 专属分支）
+  },
+);
+```
+
+**请求类型定义**（`packages/isomorphic-lib/src/types.ts:4590-4615`）：
+
+```typescript
+export const MobilePushMessageTemplateTestRequest = Type.Object({
+  ...BaseMessageTemplateTestRequest,
+  channel: Type.Literal(ChannelType.MobilePush),
+  provider: Type.Optional(Type.Enum(MobilePushProviderType)),
+});
+
+export const MessageTemplateTestRequest = Type.Union([
+  EmailMessageTemplateTestRequest,
+  SmsMessageTemplateTestRequest,
+  MobilePushMessageTemplateTestRequest,  // ✅ 类型定义存在
+  WebhookMessageTemplateTestRequest,
+]);
+```
+
+**Dashboard 侧调用**（`packages/dashboard/src/lib/useTestTemplateMutation.ts:61`）：
+
+```typescript
+const response = await axios.post<MessageTemplateTestResponse>(
+  `${baseApiUrl}/content/templates/test`,  // → POST /api/content/templates/test
+  fullRequestParams,
+  ...
+);
+```
+
+**contentController 中两处显式的 Mobile Push 未实现**：
+
+**位置 1：templates/reset 路由**（`packages/api/src/controllers/contentController.ts:271-273`）
+```typescript
+case ChannelType.MobilePush: {
+  throw new Error("Mobile push templates unimplemented");
+}
+```
+
+**位置 2：templates/test 错误处理分支缺失**（`packages/api/src/controllers/contentController.ts:353-521`）
+```typescript
+if (result.error.type === InternalEventType.MessageFailure) {
+  switch (result.error.variant.type) {
+    case ChannelType.Webhook: { /* ... */ }
+    case ChannelType.Sms:     { /* ... */ }
+    case ChannelType.Email:   { /* ... */ }
+    // ❌ 无 ChannelType.MobilePush case
+    // ❌ Mobile Push 错误会被直接走到最后的默认错误处理
+  }
+}
+```
+
+#### 4.2.2 messaging 分发端与 contentController 的未实现对应关系
+
+**完整调用链**：
+
+```
+Dashboard (templateEditor.tsx → useTestTemplateMutation)
+    ↓
+POST /api/content/templates/test
+    ↓
+contentController.ts:332-333
+    async (request, reply) => {
+      const result = await testTemplate(request.body);  // 入口
+      ...
+    }
+    ↓
+backend-lib/src/messaging.ts:2422 → testTemplate(request)
+    ├── 第 2477 行: switch (request.channel) {
+    │     case ChannelType.MobilePush: {
+    │       sendMessageParams = {
+    │         ...baseSendMessageParams,
+    │         provider: request.provider,
+    │         channel: request.channel,   // ✅ 构造参数
+    │       };
+    │       break;
+    │     }
+    │   }
+    └── 第 2513 行: return sendMessage(sendMessageParams);
+    ↓
+backend-lib/src/messaging.ts:2400 → sendMessage(params)
+    └── 第 2414 行: switch (params.channel) {
+          case ChannelType.MobilePush:
+            throw new Error("not implemented");  // ❌ 最终失败点
+        }
+```
+
+**未实现位置对应表**：
+
+| 层级 | 文件位置 | 实现状态 | 说明 |
+|------|----------|---------|------|
+| **类型定义** | `types.ts:4590-4615` | ✅ 完整 | `MobilePushMessageTemplateTestRequest` 已定义 |
+| **Dashboard 调用** | `useTestTemplateMutation.ts:25` | ✅ 支持 | 类型包含 `Omit<MobilePushMessageTemplateTestRequest>` |
+| **API 路由** | `contentController.ts:320-563` | ✅ 入口 | `/templates/test` 接受所有 MessageTemplateTestRequest |
+| **testTemplate 分发** | `messaging.ts:2477-2512` | ✅ 有 case | switch 语句处理 MobilePush |
+| **sendMessage 分发** | `messaging.ts:2414-2415` | ❌ 抛错 | 最终失败点：`throw new Error("not implemented")` |
+| **contentController 错误处理** | `contentController.ts:353-521` | ❌ 无 case | 无 MobilePush 错误处理分支 |
+| **templates/reset 路由** | `contentController.ts:271-273` | ❌ 抛错 | 直接 `throw new Error("Mobile push templates unimplemented")` |
+
+**关键发现**：
+- **上游全部完整**：类型定义、Dashboard 调用、API 路由、testTemplate 分发都支持 Mobile Push
+- **唯一缺失点**：`sendMessage()` 函数中的 `case ChannelType.MobilePush` 直接抛错
+- **额外缺失**：contentController 的 `templates/reset` 路由也直接抛错
+
+#### 4.2.3 模板定义与结构
+
+**文件位置**：`packages/isomorphic-lib/src/types.ts:1738-1755`
+
+```typescript
+export const MobilePushTemplateResource = Type.Object({
+  type: Type.Literal(ChannelType.MobilePush),
+  title: Type.Optional(Type.String()),
+  body: Type.Optional(Type.String()),
+  imageUrl: Type.Optional(Type.String()),
+  android: Type.Optional(
+    Type.Object({
+      notification: Type.Object({
+        channelId: Type.Optional(Type.String()),
+      }),
+    }),
+  ),
+}, { description: "Mobile push template resource" });
+```
+
+**模板字段说明**：
+| 字段 | 类型 | 用途 |
+|------|------|------|
+| `title` | String | 通知标题 |
+| `body` | String | 通知正文 |
+| `imageUrl` | String | 富通知图片 URL |
+| `android.notification.channelId` | String | Android 通知渠道 ID |
+
+**标识符键**（`packages/isomorphic-lib/src/channels.ts:3-10`）：
+```typescript
+export const CHANNEL_IDENTIFIERS = {
+  [ChannelType.Email]: "email",
+  [ChannelType.MobilePush]: "deviceToken",
+  [ChannelType.Sms]: "phone",
+};
+```
+
+#### 4.2.4 如果发送功能实现了，会经过什么链路？
+
+根据其他渠道的模式（Email/SMS），如果 Mobile Push 发送实现了，链路应该是：
+
+```
+testTemplate() 或 Journey/Broadcast
+    ↓
+sendMessage({ channel: "MobilePush", templateId, userPropertyAssignments, ... })
+    ↓
+getSendMessageModels({ workspaceId, templateId, channel: "MobilePush", useDraft, ... })
+    ↓
+findMessageTemplate({ id: templateId, channel })
+    ↓
+版本选择: definitionFromDraft ?? definition
+    ↓
+标识符键检查: identifierKey = CHANNEL_IDENTIFIERS[ChannelType.MobilePush] = "deviceToken"
+    ↓
+标识符值检查: userPropertyAssignments["deviceToken"] 必须存在且为 string
+    ↓
+字段渲染（假设 sendMobilePush 类似 sendEmail）:
+    title → renderLiquid()
+    body → renderLiquid()
+    imageUrl → renderLiquid()
+    ↓
+构造 FCM/APNS payload (token, notification: { title, body, imageUrl }, data, ...)
+    ↓
+调用 FCM/APNS SDK 发送
+```
+
+**但由于 `sendMessage()` 中直接抛错，以下代码**从未被执行**：
+- `getSendMessageModels()` 对 Mobile Push 的模板获取
+- `findMessageTemplate()` 对 Mobile Push 模板的查询
+- `identifierKey` 对 `deviceToken` 的检查
+- 任何 `title`/`body`/`imageUrl` 的 Liquid 渲染
+- FCM/APNS payload 的组装
+
+#### 4.2.5 FCM 发送基础设施（存在但未使用）
+
+**文件位置**：`packages/backend-lib/src/destinations/fcm.ts`
+
+```typescript
+export async function sendNotification({
+  key,
+  ...message
+}: Message & { key: string }): Promise<Result<string, Error>> {
+  const serviceAccount = extractServiceAccount(key);
+  const app = getApp(JSON.stringify(serviceAccount), serviceAccount);
+  const messaging = getMessaging(app);
+
+  try {
+    // 直接透传给 Firebase，无任何 payload 大小校验
+    const fcmMessageId = await messaging.send(message);
+    return ok(fcmMessageId);
+  } catch (e) {
+    return err(e as Error);
+  }
+}
+```
+
+**Firebase Admin SDK 的 Message 类型**：
+```typescript
+interface Message {
+  token?: string;           // FCM 设备 token
+  notification?: {
+    title?: string;
+    body?: string;
+    imageUrl?: string;
+  };
+  data?: Record<string, string>;
+  android?: { /* Android 特定配置 */ };
+  apns?: { /* iOS 特定配置 */ };
+}
+```
+
+#### 4.2.6 payload 大小校验为何缺失？按层级分析
+
+有 **4 个层级** 的缺失导致 Mobile Push 的 payload 大小校验完全不存在：
+
+| 层级 | 文件/位置 | 缺失情况 | 影响 |
+|------|-----------|---------|------|
+| **第 1 层：发送入口** | `messaging.ts:2414-2415` | ❌ 直接抛错 | 任何发送请求都不会到后续流程 |
+| **第 2 层：渲染函数** | 无 `sendMobilePush()` | ❌ 不存在 | 没有地方插入 `title`/`body`/`data` 的渲染和校验 |
+| **第 3 层：FCM 基础设施** | `destinations/fcm.ts` | ❌ 直接透传 | `sendNotification()` 没有 `Buffer.byteLength()` 检查 |
+| **第 4 层：模板保存** | `messaging.ts:227-382` | ❌ 无渠道特定校验 | 保存时也没有字符数/大小警告 |
+
+**逐层详细分析**：
+
+**第 1 层：发送入口未实现**（根本原因）
+
+**文件位置**：`packages/backend-lib/src/messaging.ts:2414-2415`
+```typescript
+case ChannelType.MobilePush:
+  throw new Error("not implemented");
+```
+
+因为发送从未发生，所以没有人会遇到 payload 大小超限的问题。这是最根本的原因。
+
+**第 2 层：Mobile Push 渲染函数不存在**
+
+对比 Email：
+```typescript
+// Email 有完整的 sendEmail() 函数，在其中调用 renderValues()
+case ChannelType.Email:
+  return sendEmail(params);  // messaging.ts:2411
+```
+
+对比 SMS：
+```typescript
+// SMS 有完整的 sendSms() 函数
+case ChannelType.Sms:
+  return sendSms(params);  // messaging.ts:2413
+```
+
+**Mobile Push 没有** `sendMobilePush()` 函数。没有发送函数，就没有地方：
+- 从模板中读取 `title`/`body`/`imageUrl`
+- 调用 `renderLiquid()` 进行变量替换
+- 在渲染后检查 `JSON.stringify(payload).length`
+
+**第 3 层：FCM 基础设施无校验**
+
+**文件位置**：`packages/backend-lib/src/destinations/fcm.ts`
+```typescript
+const fcmMessageId = await messaging.send(message);
+```
+
+即使 `sendMobilePush()` 实现了，如果直接调用 `fcm.ts` 的 `sendNotification()`，仍然没有校验，因为：
+- 没有 `Buffer.byteLength(JSON.stringify(message), 'utf8') > 4096` 检查
+- 没有 `title.length > 65` 警告
+- 没有 `body.length > 240` 警告
+- Firebase SDK 只会在发送时抛出错误，没有前置校验
+
+**第 4 层：模板保存时也无校验**
+
+**文件位置**：`packages/backend-lib/src/messaging.ts:227-382`（`upsertMessageTemplate`）
+
+保存时校验包括：
+- UUID 格式
+- 名称唯一性
+- 标识符键存在性（仅 Email/SMS）
+
+**完全没有**：
+```typescript
+// 缺失的校验（以 Mobile Push 为例）：
+if (definition.title && definition.title.length > 100) {
+  return err({ type: "TitleTooLong", message: "Title should be < 65 chars" });
+}
+if (definition.body && Buffer.byteLength(definition.body, 'utf8') > 2000) {
+  return err({ type: "BodyTooLong", message: "FCM payload limit is 4KB total" });
+}
+```
+
+**FCM/APNS 行业标准限制**：
+- **FCM**：总 payload 上限 **4096 字节**
+- **APNS**：前台通知 **4096 字节**，静默推送 **5120 字节**
+- 建议：`title` < 65 字符，`body` < 240 字符（状态栏显示限制）
+- 超过限制时：Firebase 抛出 `messaging/invalid-argument`
+
+---
+
+### 4.3 模板保存时的校验
+
+#### 4.3.1 UUID 格式校验
 
 **文件位置**：`packages/backend-lib/src/messaging.ts:227-382`
-
-#### 4.2.1 UUID 格式校验
 
 ```typescript
 if (data.id && !validateUuid(data.id)) {
@@ -951,7 +1275,7 @@ if (data.id && !validateUuid(data.id)) {
 }
 ```
 
-#### 4.2.2 标识符键校验（Email/SMS）
+#### 4.3.2 标识符键校验（Email/SMS）
 
 **文件位置**：`packages/backend-lib/src/messaging.ts:239-263`
 
