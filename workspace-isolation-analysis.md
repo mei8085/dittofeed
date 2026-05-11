@@ -1267,7 +1267,373 @@ if (workspaceId !== workspace.id) {
 
 ---
 
-## 十一、关键代码文件索引
+## 十一、SendGrid 延迟事件回填链路深度分析
+
+### 11.1 延迟事件回填的业务背景
+
+SendGrid Webhook 事件分为两类：
+
+| 事件类型 | 示例 | 是否包含 workspaceId | 处理方式 |
+|---------|------|---------------------|---------|
+| 即时事件 | open, click, delivered, dropped | 是（通过 sg_message_id + workspaceId 推断） | 直接处理 |
+| 延迟事件 | bounce, spamreport | 否 | 需通过 smtp-id 回填 |
+
+**延迟事件的问题**：
+- bounce/spamreport 事件只有 `smtp-id`，没有 `sg_message_id`
+- 无法直接从事件中提取 `workspaceId`
+- 需要先通过 `smtp-id` 查找之前的 `processed` 事件
+
+### 11.2 完整回填链路
+
+**位置**：`packages/backend-lib/src/destinations/sendgrid.ts:217-370`
+
+```
+SendGrid Webhook Request (bounce/spamreport events)
+    ↓
+handleSendgridEvents()
+    ↓
+Step 1: 分类事件
+    ├── immediateEvents: open, click, delivered, dropped
+    └── delayedEvents: bounce, spamreport (by smtp-id)
+    ↓
+Step 2: 跨 workspace 查询 processed 事件  ← 风险点
+    ├── findUserEventsById({ messageIds: ['processed:smtp1', ...] })
+    │   └── 没有传递 workspaceId！
+    └── ClickHouse 查询: WHERE message_id IN (...)
+    ↓
+Step 3: 后置校验（逐个事件）
+    ├── 解析 properties 中的 workspaceId
+    ├── 校验是否一致
+    └── 不一致则跳过
+    ↓
+Step 4: 签名验证（按 workspace）
+    ├── 查询 workspace 的 SendGrid secret
+    └── verifyTimestampedSignature()
+    ↓
+Step 5: 写入事件
+    └── submitSendgridEvents({ workspaceId, events })
+```
+
+### 11.3 findUserEventsById 的调用分析
+
+**调用位置**：`packages/backend-lib/src/destinations/sendgrid.ts:267-269`
+
+```typescript
+const processedForDelayedEvents = await findUserEventsById({
+  messageIds: Array.from(delayedEvents.keys()).map((id) => `processed:${id}`),
+  // 没有传递 workspaceId！
+});
+```
+
+**函数定义**：`packages/backend-lib/src/userEvents.ts:922-976`
+
+```typescript
+export async function findUserEventsById({
+  messageIds,
+  workspaceId,  // 可选参数
+}: {
+  messageIds: string[];
+  workspaceId?: string;
+}): Promise<UserEventsWithTraits[]> {
+  // ...
+  if (workspaceId) {
+    clauses.push(`workspace_id = ${qb.addQueryValue(workspaceId, "String")}`);
+  }
+  // 不传 workspaceId 时，WHERE 只有 message_id IN (...)
+}
+```
+
+**生成的 SQL（不传 workspaceId）**：
+```sql
+SELECT workspace_id, user_id, ...
+FROM user_events_v2
+WHERE message_id IN ('processed:smtp-id-1', 'processed:smtp-id-2', ...)
+-- 没有 workspace_id 过滤！
+```
+
+**生成的 SQL（传 workspaceId）**：
+```sql
+SELECT workspace_id, user_id, ...
+FROM user_events_v2
+WHERE message_id IN ('processed:smtp-id-1', ...)
+  AND workspace_id = 'ws-xxx'
+```
+
+### 11.4 后置校验逻辑分析
+
+**位置**：`packages/backend-lib/src/destinations/sendgrid.ts:273-306`
+
+```typescript
+for (const event of processedForDelayedEvents) {
+  const smtpId = event.message_id.split(":")[1];
+  if (!smtpId) continue;
+
+  const delayedEvent = delayedEvents.get(smtpId);
+  if (!delayedEvent) continue;
+
+  // 解析 processed 事件的 properties（包含 MESSAGE_METADATA_FIELDS）
+  const parsedProperties = jsonParseSafeWithSchema(
+    event.properties,
+    MessageMetadataFields,
+  );
+  if (parsedProperties.isErr()) continue;
+
+  const { workspaceId: processedWorkspaceId, userId } = parsedProperties.value;
+  if (!processedWorkspaceId || !userId) continue;
+
+  // 关键点：第一次匹配到的 workspaceId 成为期望值
+  if (!workspaceId) {
+    workspaceId = processedWorkspaceId;
+  }
+
+  // 不匹配则跳过（软校验）
+  if (workspaceId !== processedWorkspaceId) {
+    continue;
+  }
+
+  backfilledDelayedEvents.push({
+    ...delayedEvent,
+    ...parsedProperties.value,
+  });
+}
+```
+
+**校验逻辑拆解**：
+
+| 步骤 | 逻辑 | 风险点 |
+|------|------|--------|
+| 1 | 从 `processed` 事件 properties 提取 `workspaceId` | 依赖数据完整性 |
+| 2 | 第一个匹配到的值设为 `workspaceId` | 批量事件时顺序敏感 |
+| 3 | 后续事件必须与此值一致 | 跨 workspace 批量事件会丢失 |
+| 4 | 不一致则 `continue`（跳过）而非报错 | 静默失败，难以排查 |
+
+### 11.5 可复现的误配场景
+
+#### 场景 A：批量延迟事件跨 workspace 冲突
+
+**前提条件**：
+- Workspace A 和 Workspace B 共享同一个 SendGrid Webhook 端点
+- 两个 workspace 的延迟事件在同一批次到达
+
+**触发流程**：
+1. Workspace A 发送邮件 → `smtp-id = "batch-001"`
+2. Workspace B 发送邮件 → `smtp-id = "batch-002"`
+3. SendGrid 同时推送两个 bounce 事件
+4. 批次中没有 immediate events（只有 bounces）
+
+**执行结果**：
+```
+workspaceId = undefined（初始值）
+
+findUserEventsById 查询：
+  message_id IN ('processed:batch-001', 'processed:batch-002')
+  ↓
+  返回两条记录：
+    1. workspace_id = ws-B, message_id = processed:batch-002
+    2. workspace_id = ws-A, message_id = processed:batch-001
+
+后置校验：
+  第 1 条：workspaceId = undefined → 设为 ws-B ✓
+  第 2 条：workspaceId = ws-B, processedWorkspaceId = ws-A → 不匹配，跳过 ✗
+
+最终：只有 Workspace B 的事件被处理，A 的 bounce 事件丢失
+```
+
+**为什么可能发生**：
+- ClickHouse 查询结果顺序不确定（除非显式 ORDER BY）
+- 先返回哪条记录取决于存储顺序
+
+#### 场景 B：无效签名请求的性能攻击
+
+**前提条件**：
+- 攻击者知道 Webhook 端点
+- 攻击者构造大量 bounce 事件
+
+**触发流程**：
+1. 攻击者发送 1000 个 bounce 事件，每个都有不同的 smtp-id
+2. 即使签名无效，代码仍会执行到 Step 2
+3. `findUserEventsById` 跨 workspace 查询 1000 个 messageId
+
+**影响**：
+- 每次无效请求都会触发 ClickHouse 查询
+- 大量无效请求可能造成性能压力
+- 签名验证在查询**之后**执行
+
+**代码时序**：
+```typescript
+// Step 2: 查询在签名验证之前！
+const processedForDelayedEvents = await findUserEventsById({...});
+
+// ... 中间处理 ...
+
+// Step 4: 签名验证在最后
+const verified = verifyTimestampedSignature({...});
+if (!verified) {
+  return err({ message: "Invalid signature." });
+}
+```
+
+#### 场景 C：父子工作空间的延迟事件处理
+
+**前提条件**：
+- Parent 工作空间 P 有子工作空间 C1、C2
+- C1 发送邮件，workspace_id = C1
+- SendGrid Webhook 配置在 P 的层面
+
+**分析**：
+- 延迟事件没有 workspaceId，只能通过 processed 事件推断
+- processed 事件的 workspace_id 是 C1
+- 推断出的 workspaceId = C1
+- 签名验证使用 C1 的 secret（不是 P 的）
+
+**这是否是问题**？
+- 如果 Webhook 端点是按 workspace 隔离的（每个 workspace 有不同的 URL），则没问题
+- 如果共享端点，则需要确保推断出正确的 workspace
+
+### 11.6 隔离边界分析
+
+#### 数据泄露风险评估
+
+| 风险点 | 评估 | 说明 |
+|--------|------|------|
+| 跨 workspace 数据查询 | ⚠️ 中等 | 确实跨 workspace 查询了，但结果不会被误用 |
+| 错误 workspace 写入 | ✅ 低 | 后置校验和签名验证双重保障 |
+| 数据泄露给调用方 | ✅ 低 | 查询结果在服务内部使用，不对外暴露 |
+
+**结论**：
+- 不存在跨 workspace 数据泄露风险
+- 后置校验确保只有匹配的事件被处理
+- 签名验证确保只有合法请求能写入数据
+
+#### 性能影响评估
+
+| 场景 | 有 workspaceId | 无 workspaceId |
+|------|---------------|---------------|
+| 查询范围 | 单 workspace | 全表 |
+| 索引使用 | 排序键前缀 workspace_id + message_id | 仅 message_id bloom filter |
+| 性能 | 最优 | 次之 |
+
+**ClickHouse 表结构**：
+```sql
+ORDER BY (workspace_id, processing_time, user_or_anonymous_id, event_time, message_id)
+INDEX message_id_idx message_id TYPE bloom_filter(0.01) GRANULARITY 4
+```
+
+**分析**：
+- 传 `workspaceId`：可以利用排序键前缀，精确定位数据范围
+- 不传 `workspaceId`：只能用 bloom filter 过滤 message_id，可能扫描更多 granule
+
+### 11.7 改进建议
+
+#### 建议 1：重构流程，先推断 workspaceId 再查询
+
+**当前问题**：先查询，再从结果推断 workspaceId
+
+**改进方案**：
+```typescript
+// 方案 A：如果有 immediate events，先从其中提取 workspaceId
+let workspaceId: string | undefined;
+for (const event of sendgridEvents) {
+  if (event.workspaceId) {
+    workspaceId = event.workspaceId;
+    break;
+  }
+}
+
+// 如果有 workspaceId，查询时带上
+const processedForDelayedEvents = await findUserEventsById({
+  messageIds: [...],
+  workspaceId,  // 传 workspaceId（如果有）
+});
+```
+
+#### 建议 2：将 workspaceId 设为必需参数
+
+**修改**：`packages/backend-lib/src/userEvents.ts:922-928`
+
+```typescript
+export async function findUserEventsById({
+  messageIds,
+  workspaceId,
+}: {
+  messageIds: string[];
+  workspaceId: string;  // 改为必需
+}): Promise<UserEventsWithTraits[]>
+```
+
+**影响**：
+- 编译时检查所有调用点
+- SendGrid 场景需要特殊处理（先推断再查询）
+
+#### 建议 3：签名验证前置
+
+**当前时序**：查询 → 校验 → 签名验证
+
+**建议时序**：
+1. 先尝试从 immediate events 提取 workspaceId
+2. 如果有 workspaceId，先验证签名
+3. 再执行查询
+
+```typescript
+// 改进后
+let workspaceId: string | undefined;
+for (const event of sendgridEvents) {
+  if (event.workspaceId) {
+    workspaceId = event.workspaceId;
+    break;
+  }
+}
+
+// 如果有 workspaceId，先验证签名
+if (workspaceId) {
+  const verified = verifyTimestampedSignature({...});
+  if (!verified) {
+    return err({ message: "Invalid signature." });
+  }
+}
+
+// 再执行查询
+const processedForDelayedEvents = await findUserEventsById({
+  messageIds: [...],
+  workspaceId,
+});
+```
+
+#### 建议 4：增强错误日志和监控
+
+**问题**：当前不一致的事件被静默跳过
+
+**改进**：
+```typescript
+if (workspaceId !== processedWorkspaceId) {
+  logger().warn(
+    {
+      expectedWorkspaceId: workspaceId,
+      actualWorkspaceId: processedWorkspaceId,
+      messageId: event.message_id,
+      smtpId,
+    },
+    "Workspace mismatch in delayed event backfill, skipping",
+  );
+  continue;
+}
+```
+
+### 11.8 调用点唯一性确认
+
+**全局搜索结果**：`findUserEventsById` 只有一个调用点
+
+| 调用位置 | 传递 workspaceId | 说明 |
+|---------|-----------------|------|
+| `sendgrid.ts:267-269` | 否 | SendGrid 延迟事件回填 |
+
+**结论**：
+- 这是唯一的调用点
+- 修改函数签名影响范围可控
+
+---
+
+## 十二、关键代码文件索引
 
 | 功能 | 文件路径 |
 |------|----------|
